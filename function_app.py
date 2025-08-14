@@ -3,8 +3,9 @@ import logging
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-@app.route(route="strava_wbehook")
-def strava_wbehook(req: func.HttpRequest) -> func.HttpResponse:
+
+@app.route(route="strava_webhook")
+def strava_webhook(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
 
     name = req.params.get('name')
