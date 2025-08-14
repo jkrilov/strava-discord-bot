@@ -26,6 +26,7 @@ def strava_webhook(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="strava_webhook", methods=["POST"])
 def strava_webhook_events(req: func.HttpRequest) -> func.HttpResponse:
     """POST event receiver for Strava activity update/create/delete notifications."""
+    logging.info("Strava event POST received")
     raw_body = req.get_body()
     if not raw_body:
         logging.warning("Strava event POST missing body")
