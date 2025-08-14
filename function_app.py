@@ -7,7 +7,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 @app.route(route="strava_webhook")
 def strava_webhook(req: func.HttpRequest) -> func.HttpResponse:
-    """ Webhook for Strava API subscription """
+    """ Webhook for Strava API subscription {"id":298415} """
     logging.info('Python HTTP trigger function processed a request.')
 
     # log request body
