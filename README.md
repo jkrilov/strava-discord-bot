@@ -30,6 +30,11 @@ Optional:
 - `STRAVA_SINCE_SECONDS` — Recent window in seconds (default: `3600`)
 - `STRAVA_ACTIVITIES_TABLE` — Table name (default: `StravaActivities`)
 - `AzureWebJobsStorage__clientId` — Client ID for a user-assigned managed identity
+- `DISCORD_WEBHOOK_URL` — Discord webhook to post activity summaries (if set)
+- `STRAVA_PER_PAGE` — Page size for club feed (default: `50`)
+- `STRAVA_MAX_PAGES` — Max pages fetched each run (default: `10`)
+- `STRAVA_USE_TIME_FILTER` — `true`/`false`; when `true`, attempts time filtering using `updated_at`/`start_date` (default: `true`)
+- `STRAVA_MAX_ACTIVITIES` — Max activities processed per run (default: `0` for unlimited)
 
 ## Managed Identity and RBAC
 
@@ -62,6 +67,15 @@ Table: `StravaActivities`
 
 ## Next steps
 
-- Add a Discord notifier after successful upsert to post activity summaries.
+- Discord posting is enabled when `DISCORD_WEBHOOK_URL` is set:
+  - Converts meters→miles and seconds→minutes.
+  - Skips distance display when < 0.05 miles (e.g., weight training).
+  - Posts new messages and edits prior messages if the activity name or summary changes.
 - Persist a cursor (last seen timestamp) to further reduce duplicates.
 - Add tests and structured logging.
+
+## Backfill older activities
+
+- The club feed doesn’t guarantee a dedicated timestamp for all entries, but many items include `updated_at` or `start_date`.
+- You can increase `STRAVA_MAX_PAGES` (and optionally disable `STRAVA_USE_TIME_FILTER=false`) to sweep older pages.
+- Deduping is enforced by the synthetic RowKey, so repeated sweeps won’t create duplicates.

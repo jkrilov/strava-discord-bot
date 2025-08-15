@@ -35,6 +35,10 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     club_id = os.getenv("STRAVA_CLUB_ID")
     token = _get_bearer_token()
     since_window = int(os.getenv("STRAVA_SINCE_SECONDS", "3600"))
+    per_page = int(os.getenv("STRAVA_PER_PAGE", "50") or "50")
+    max_pages = int(os.getenv("STRAVA_MAX_PAGES", "10") or "10")
+    max_items = int(os.getenv("STRAVA_MAX_ACTIVITIES", "0") or "0")  # 0 = unlimited
+    use_time_filter = (os.getenv("STRAVA_USE_TIME_FILTER", "true").lower() == "true")
     if not club_id or not token:
         logging.error(
             "Missing STRAVA_CLUB_ID or token; set STRAVA_ACCESS_TOKEN or "
@@ -49,9 +53,10 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     # Optional since filtering: Strava supports 'after' (unix timestamp) for some endpoints; for clubs
     # endpoint, we'll page and filter client-side on 'start_date' or 'updated_at' if present.
     after_ts = int((utc_now.timestamp()) - since_window)
-    params = {"per_page": 50, "page": 1}
+    params = {"per_page": per_page, "page": 1}
 
     collected = 0
+    done = False
     try:
         while True:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
@@ -65,7 +70,7 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
                 # Filter by time window if possible
                 updated = act.get("updated_at") or act.get("start_date")
                 keep = True
-                if updated:
+                if use_time_filter and updated:
                     try:
                         # updated_at/start_date are ISO-8601; compare to after_ts
                         ts = int(datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp())
@@ -76,10 +81,15 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
                     continue
                 collected += 1
                 _process_club_activity(act)
+                if max_items > 0 and collected >= max_items:
+                    done = True
+                    break
             # Next page
             params["page"] += 1
             # Safety: avoid chasing too far if within small window
-            if params["page"] > 10:
+            if params["page"] > max_pages:
+                break
+            if done:
                 break
     except requests.RequestException:
         logging.exception("Network error fetching club activities")
@@ -172,7 +182,7 @@ def _process_club_activity(activity: dict) -> None:
                 import json as _json  # local import to avoid top-level dependency at cold start cost
 
                 entity["athlete_json"] = _json.dumps(athlete, ensure_ascii=False)
-            except Exception:
+            except (TypeError, ValueError):
                 # best-effort only
                 pass
 
@@ -188,7 +198,14 @@ def _process_club_activity(activity: dict) -> None:
         # Remove keys with value None (Table Storage doesn't accept None)
         entity = {k: v for k, v in entity.items() if v is not None}
 
+        # First upsert core activity data
         table.upsert_entity(entity=entity, mode="merge")
+
+        # Post or update to Discord if configured
+        try:
+            _post_or_edit_discord(table, entity)
+        except (requests.RequestException, ValueError, OSError):
+            logging.exception("Discord post/edit failed")
 
         logging.info(
             "Upserted club activity by %s %s: %s (PK=%s RK=%s)",
@@ -267,7 +284,7 @@ def _get_bearer_token() -> Optional[str]:
         else:
             cached_exp = 0
         cached_rt = _TOKEN_CACHE.get("refresh_token")
-    except Exception:
+    except (KeyError, TypeError):
         cached_token = None
         cached_exp = 0
         cached_rt = None
@@ -306,5 +323,98 @@ def _get_bearer_token() -> Optional[str]:
     except OSError:
         logging.exception("Failed to create TableClient for activities (OS error)")
         return None
+
+
+def _meters_to_miles(meters: Any) -> Optional[float]:
+    try:
+        if meters is None:
+            return None
+        m = float(meters)
+        return m / 1609.344
+    except (TypeError, ValueError):
+        return None
+
+
+def _seconds_to_minutes(seconds: Any) -> Optional[int]:
+    try:
+        if seconds is None:
+            return None
+        s = float(seconds)
+        return int(round(s / 60.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_discord_content(entity: Dict[str, Any]) -> str:
+    firstname = entity.get("athlete_firstname") or ""
+    lastname = entity.get("athlete_lastname") or ""
+    athlete_name = (f"{firstname} {lastname}").strip() or "Someone"
+
+    name = entity.get("name") or entity.get("sport_type") or entity.get("type") or "Workout"
+    sport = entity.get("sport_type") or entity.get("type")
+
+    miles = _meters_to_miles(entity.get("distance"))
+    mins = _seconds_to_minutes(entity.get("moving_time"))
+
+    parts: list[str] = [f"{athlete_name}: {name}"]
+
+    # Include distance if meaningful
+    if miles is not None and miles >= 0.05:
+        parts.append(f"{miles:.2f} mi")
+
+    # Always include moving time when available
+    if mins is not None and mins > 0:
+        parts.append(f"{mins} min")
+
+    if sport and sport not in {"Run", "Ride", "Walk"}:
+        parts.append(f"({sport})")
+
+    content = " - ".join(parts)
+    # Discord limit is 2000 chars; keep it short
+    return content[:1800]
+
+
+def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        return
+
+    content = _build_discord_content(entity)
+    if not content:
+        return
+
+    existing_content = entity.get("discord_content")
+    message_id = entity.get("discord_message_id")
+
+    if message_id and existing_content:
+        # Edit existing message if content changed
+        if content == existing_content:
+            return
+        base = webhook_url.split("?")[0].rstrip("/")
+        edit_url = f"{base}/messages/{message_id}"
+        resp = requests.patch(edit_url, json={"content": content}, timeout=15)
+        if resp.status_code in (200, 204):
+            entity["discord_content"] = content
+            entity["discord_updated_at"] = datetime.now(timezone.utc)
+            table.upsert_entity(entity=entity, mode="merge")
+        else:
+            logging.warning("Discord edit failed: %s %s", resp.status_code, resp.text[:200])
+        return
+
+    # Post new message and capture message id with wait=true
+    wait_url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
+    resp = requests.post(wait_url, json={"content": content}, timeout=15)
+    if resp.status_code in (200, 204):
+        try:
+            body = resp.json() if resp.status_code == 200 else {}
+        except ValueError:
+            body = {}
+        msg_id = body.get("id")
+        entity["discord_message_id"] = msg_id
+        entity["discord_content"] = content
+        entity["discord_posted_at"] = datetime.now(timezone.utc)
+        table.upsert_entity(entity=entity, mode="merge")
+    else:
+        logging.warning("Discord post failed: %s %s", resp.status_code, resp.text[:200])
 
 
