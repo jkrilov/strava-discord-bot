@@ -1,524 +1,221 @@
-import json
 import os
 import logging
 from datetime import datetime, timezone
+from typing import Optional
+
 import azure.functions as func
 import requests
-from azure.data.tables import TableServiceClient, UpdateMode
-try:
-    from azure.identity import ManagedIdentityCredential  # type: ignore
-except ImportError:  # azure-identity optional until installed
-    ManagedIdentityCredential = None  # type: ignore
+from azure.identity import ManagedIdentityCredential
+from azure.data.tables import TableServiceClient, TableClient
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+app = func.FunctionApp()
 
 
-TABLE_NAME = os.getenv("STRAVA_TOKENS_TABLE", "StravaTokens")
-ACTIVITIES_TABLE_NAME = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
+def collect_club_activities(myTimer: func.TimerRequest) -> None:
+    """Timer runs every 5 minutes to collect latest activities for a Strava club.
 
-
-def _get_table_client():
-    """Return a TableClient for the tokens table using managed identity.
-
-    Only supports connection-stringless access via AzureWebJobsStorage__tableServiceUri
-    and a system or user-assigned managed identity with 'Storage Table Data Contributor'.
+    Env vars required:
+    - STRAVA_CLUB_ID: The Strava club ID to poll
+    - STRAVA_ACCESS_TOKEN: A personal access token or app token authorized to read club activities
+      (From a Strava account with access to the club)
+    - STRAVA_SINCE_SECONDS: Optional; only fetch activities updated in the last N seconds (default: 3600)
     """
-    table_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
-    if table_uri:
-        if ManagedIdentityCredential is None:
-            logging.error(
-                "azure-identity not installed; cannot use managed identity for Table Storage. "
-                "Install azure-identity to use AzureWebJobsStorage__tableServiceUri."
-            )
-            return None
-        try:
-            # Use only ManagedIdentityCredential to avoid noisy DefaultAzureCredential chain when running locally.
-            user_client_id = (
-                os.getenv("AzureWebJobsStorage__clientId")
-                or os.getenv("AZURE_CLIENT_ID")
-                or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
-            )
-            if user_client_id:
-                logging.info("Using user-assigned managed identity (client_id ending ...%s) for Table access", user_client_id[-6:])
-                cred = ManagedIdentityCredential(client_id=user_client_id)
-            else:
-                logging.info("Using system-assigned managed identity for Table access")
-                cred = ManagedIdentityCredential()
-            svc = TableServiceClient(endpoint=table_uri, credential=cred)
-            try:
-                svc.create_table_if_not_exists(TABLE_NAME)
-            except Exception:  # noqa: BLE001
-                pass
-            return svc.get_table_client(TABLE_NAME)
-        except Exception:  # noqa: BLE001
-            if user_client_id:
-                logging.exception(
-                    "Managed identity auth failed for user-assigned identity. Ensure: (1) Identity is assigned to the Function App, "
-                    "(2) 'Storage Table Data Contributor' role on the storage account, (3) AZURE_CLIENT_ID matches the identity's client ID."
-                )
-            else:
-                logging.exception(
-                    "Managed identity auth failed for system-assigned identity. Ensure identity is enabled on the Function App and has 'Storage Table Data Contributor' on the storage account."
-                )
-            return None
+    utc_now = datetime.now(timezone.utc)
+    logging.info("collect_club_activities invoked at %s", utc_now.isoformat())
 
-    logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
-    return None
-
-
-def _get_table_client_for(table_name: str):
-    """Return a TableClient for the given table using managed identity.
-
-    Expects AzureWebJobsStorage__tableServiceUri and (optionally) AzureWebJobsStorage__clientId.
-    """
-    table_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
-    if not table_uri:
-        logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
-        return None
-    if ManagedIdentityCredential is None:
-        logging.error(
-            "azure-identity not installed; cannot use managed identity for Table Storage. "
-            "Install azure-identity to use AzureWebJobsStorage__tableServiceUri."
-        )
-        return None
-    user_client_id = (
-        os.getenv("AzureWebJobsStorage__clientId")
-        or os.getenv("AZURE_CLIENT_ID")
-        or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
-    )
-    try:
-        if user_client_id:
-            cred = ManagedIdentityCredential(client_id=user_client_id)
-        else:
-            cred = ManagedIdentityCredential()
-        svc = TableServiceClient(endpoint=table_uri, credential=cred)
-        try:
-            svc.create_table_if_not_exists(table_name)
-        except Exception:  # noqa: BLE001
-            pass
-        return svc.get_table_client(table_name)
-    except Exception:  # noqa: BLE001
-        logging.exception("Failed to initialize Table client for %s", table_name)
-        return None
-
-
-def store_tokens(athlete_id: int, data: dict):
-    """Persist tokens for an athlete in Azure Table Storage.
-
-    Columns: PartitionKey, RowKey, access_token, refresh_token, expires_at, scope, updated_at.
-    """
-    table = _get_table_client()
-    if not table:
-        return False
-    entity = {
-        "PartitionKey": "athlete",
-        "RowKey": str(athlete_id),
-        "access_token": data.get("access_token"),
-        "refresh_token": data.get("refresh_token"),
-        "expires_at": int(data.get("expires_at") or 0),
-        "scope": data.get("scope"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        table.upsert_entity(entity, mode=UpdateMode.MERGE)
-        logging.info("Stored tokens for athlete %s", athlete_id)
-        return True
-    except Exception:
-        logging.exception("Failed to store tokens for athlete %s", athlete_id)
-        return False
-
-
-def get_tokens(athlete_id: int):
-    """Retrieve token entity for athlete. Returns dict or None."""
-    table = _get_table_client()
-    if not table:
-        return None
-    try:
-        entity = table.get_entity(partition_key="athlete", row_key=str(athlete_id))
-        return dict(entity)
-    except Exception:
-        return None
-
-
-def refresh_tokens(athlete_id: int):
-    """Refresh tokens if expired or within buffer. Returns (changed, entity)."""
-    buffer_secs = int(os.getenv("STRAVA_REFRESH_BUFFER", "300"))  # 5 min default
-    entity = get_tokens(athlete_id)
-    if not entity:
-        return False, None
-    expires_at = int(entity.get("expires_at") or 0)
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    if expires_at - now_ts > buffer_secs:
-        # Still valid; no refresh
-        return False, entity
-    client_id = os.getenv("STRAVA_CLIENT_ID")
-    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        logging.error("Cannot refresh tokens; missing client credentials")
-        return False, entity
-    refresh_token = entity.get("refresh_token")
-    if not refresh_token:
-        logging.error("No refresh token stored for athlete %s", athlete_id)
-        return False, entity
-    token_url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    try:
-        resp = requests.post(token_url, data=payload, timeout=10)
-    except requests.RequestException:
-        logging.exception("Network error refreshing tokens for athlete %s", athlete_id)
-        return False, entity
-    if resp.status_code != 200:
-        logging.warning(
-            "Failed to refresh tokens athlete=%s status=%s body=%s", athlete_id, resp.status_code, resp.text[:300]
-        )
-        return False, entity
-    data = resp.json()
-    store_tokens(athlete_id, data)
-    new_entity = get_tokens(athlete_id) or entity
-    logging.info("Refreshed tokens for athlete %s", athlete_id)
-    return True, new_entity
-
-
-@app.route(route="strava_webhook", methods=["GET"])
-def strava_webhook(req: func.HttpRequest) -> func.HttpResponse:
-    """GET verification endpoint for Strava subscription handshake."""
-    verify_token_expected = os.getenv("STRAVA_VERIFY_TOKEN", "STRAVA")
-    token = req.params.get('hub.verify_token')
-    challenge = req.params.get('hub.challenge')
-    mode = req.params.get('hub.mode')
-
-    if token == verify_token_expected and mode == "subscribe" and challenge:
-        logging.info("Strava webhook verification succeeded: mode=%s token_ok challenge=%s", mode, challenge)
-        return func.HttpResponse(
-            json.dumps({"hub.challenge": challenge}),
-            status_code=200,
-            mimetype="application/json"
-        )
-    logging.warning(
-        "Strava webhook verification failed: mode=%s token=%s challenge=%s expected_token=%s",
-        mode, token, challenge, verify_token_expected
-    )
-    return func.HttpResponse("Invalid request", status_code=400)
-
-
-@app.route(route="strava_webhook", methods=["POST"])
-def strava_webhook_events(req: func.HttpRequest) -> func.HttpResponse:
-    """POST event receiver for Strava activity update/create/delete notifications."""
-    logging.info("Strava event POST received")
-    raw_body = req.get_body()
-    if not raw_body:
-        logging.warning("Strava event POST missing body")
-        return func.HttpResponse("Missing body", status_code=400)
-
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        logging.exception("Invalid JSON in Strava event POST")
-        return func.HttpResponse("Invalid JSON", status_code=400)
-
-    # Log key fields (avoid logging entire payload if large)
-    aspect = payload.get("aspect_type")
-    obj_type = payload.get("object_type")
-    obj_id = payload.get("object_id")
-    owner_id = payload.get("owner_id")
-    logging.info(
-        "Strava event received: aspect=%s object_type=%s object_id=%s owner_id=%s",
-        aspect, obj_type, obj_id, owner_id
-    )
-
-    # Handle activity events: upsert into StravaActivities; fetch details for create/update when possible.
-    if obj_type == "activity" and obj_id and owner_id:
-        try:
-            activity_id = int(obj_id)
-            athlete_id = int(owner_id)
-        except Exception:
-            activity_id = None
-            athlete_id = None
-        if activity_id is not None and athlete_id is not None:
-            details = None
-            if aspect in {"create", "update"}:
-                # Ensure we have a valid token and try to get full activity details
-                try:
-                    _ = refresh_tokens(athlete_id)
-                except Exception:  # noqa: BLE001
-                    pass
-                details = _fetch_activity_details(athlete_id, activity_id)
-            _upsert_activity_event(athlete_id, activity_id, aspect, payload, details)
-
-    return func.HttpResponse("OK", status_code=200)
-
-
-def _fetch_activity_details(athlete_id: int, activity_id: int):
-    """Fetch activity details from Strava using stored tokens. Returns dict or None."""
-    entity = get_tokens(athlete_id)
-    if not entity:
-        return None
-    access_token = entity.get("access_token")
-    if not access_token:
-        return None
-    url = f"https://www.strava.com/api/v3/activities/{activity_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-    except requests.RequestException:
-        logging.exception("Failed to fetch activity %s for athlete %s", activity_id, athlete_id)
-        return None
-    if resp.status_code != 200:
-        logging.warning("Fetch activity failed id=%s status=%s body=%s", activity_id, resp.status_code, resp.text[:200])
-        return None
-    try:
-        return resp.json()
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _upsert_activity_event(
-    athlete_id: int,
-    activity_id: int,
-    aspect: str,
-    payload: dict,
-    details: dict | None,
-):
-    """Upsert the activity row in the activities table with event and optional detail fields."""
-    table = _get_table_client_for(ACTIVITIES_TABLE_NAME)
-    if not table:
+    club_id = os.getenv("STRAVA_CLUB_ID")
+    token = os.getenv("STRAVA_ACCESS_TOKEN")
+    since_window = int(os.getenv("STRAVA_SINCE_SECONDS", "3600"))
+    if not club_id or not token:
+        logging.error("Missing STRAVA_CLUB_ID or STRAVA_ACCESS_TOKEN; skipping run")
         return
-    entity: dict = {
-        "PartitionKey": str(athlete_id),
-        "RowKey": str(activity_id),
-        "object_type": payload.get("object_type"),
-        "aspect_type": aspect,
-        "event_time": int(payload.get("event_time") or 0),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    updates = payload.get("updates") or {}
-    if updates:
-        try:
-            entity["updates_json"] = json.dumps(updates)
-        except Exception:  # noqa: BLE001
-            pass
-    if aspect == "delete":
-        entity["deleted"] = True
-    # Map selected details if provided
-    if details:
-        def _maybe_set(k: str, v):
-            if v is not None:
-                entity[k] = v
-        _maybe_set("name", details.get("name"))
-        _maybe_set("sport_type", details.get("sport_type") or details.get("type"))
-        _maybe_set("distance", details.get("distance"))
-        _maybe_set("moving_time", details.get("moving_time"))
-        _maybe_set("elapsed_time", details.get("elapsed_time"))
-        _maybe_set("start_date", details.get("start_date"))
-        _maybe_set("start_date_local", details.get("start_date_local"))
-        _maybe_set("private", details.get("private"))
-        _maybe_set("visibility", details.get("visibility"))
+
+    headers = {"Authorization": f"Bearer {token}"}
+    # Strava club activities endpoint
+    url = f"https://www.strava.com/api/v3/clubs/{club_id}/activities"
+
+    # Optional since filtering: Strava supports 'after' (unix timestamp) for some endpoints; for clubs
+    # endpoint, we'll page and filter client-side on 'start_date' or 'updated_at' if present.
+    after_ts = int((utc_now.timestamp()) - since_window)
+    params = {"per_page": 50, "page": 1}
+
+    collected = 0
     try:
-        table.upsert_entity(entity, mode=UpdateMode.MERGE)
-        logging.info("Upserted activity %s for athlete %s (aspect=%s)", activity_id, athlete_id, aspect)
-    except Exception:  # noqa: BLE001
-        logging.exception("Failed to upsert activity %s for athlete %s", activity_id, athlete_id)
+        while True:
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code != 200:
+                logging.warning("Strava clubs activities failed: status=%s body=%s", resp.status_code, resp.text[:200])
+                break
+            items = resp.json() or []
+            if not items:
+                break
+            for act in items:
+                # Filter by time window if possible
+                updated = act.get("updated_at") or act.get("start_date")
+                keep = True
+                if updated:
+                    try:
+                        # updated_at/start_date are ISO-8601; compare to after_ts
+                        ts = int(datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp())
+                        keep = ts >= after_ts
+                    except Exception:
+                        keep = True
+                if not keep:
+                    continue
+                collected += 1
+                _process_club_activity(act)
+            # Next page
+            params["page"] += 1
+            # Safety: avoid chasing too far if within small window
+            if params["page"] > 10:
+                break
+    except requests.RequestException:
+        logging.exception("Network error fetching club activities")
+
+    logging.info("Collected %s activities for club %s", collected, club_id)
 
 
-@app.route(route="token_exchange", methods=["GET"])
-def token_exchange(req: func.HttpRequest) -> func.HttpResponse:
-    """OAuth callback endpoint to exchange Strava auth code for access + refresh tokens.
+def _process_club_activity(activity: dict) -> None:
+    """Handle a single club activity record.
 
-    Query params from Strava: code, scope, state, error.
-    Redirect URI configured in Strava app must match /api/token_exchange
+    Stores a flattened record into Azure Table Storage using a synthetic RowKey
+    because club activities do not include the activity ID.
     """
-    error = req.params.get("error")
-    if error:
-        logging.warning("Strava authorization error: %s", error)
-        return func.HttpResponse(json.dumps({"error": error}), status_code=400, mimetype="application/json")
+    try:
+        athlete = activity.get("athlete", {}) or {}
+        firstname = (athlete.get("firstname") or "").strip()
+        lastname = (athlete.get("lastname") or "").strip()
+        athlete_id = athlete.get("id")
 
-    code = req.params.get("code")
-    if not code:
-        return func.HttpResponse(json.dumps({"error": "missing_code"}), status_code=400, mimetype="application/json")
+        # Build synthetic ID from requested fields; normalize floats to integers (meters) to avoid
+        # floating-point representation differences.
+        distance = activity.get("distance")
+        moving_time = activity.get("moving_time")
+        elapsed_time = activity.get("elapsed_time")
+        total_elevation_gain = activity.get("total_elevation_gain")
 
-    client_id = os.getenv("STRAVA_CLIENT_ID")
-    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        logging.error("Missing STRAVA_CLIENT_ID or STRAVA_CLIENT_SECRET env vars")
-        return func.HttpResponse(
-            json.dumps({"error": "server_not_configured"}),
-            status_code=500,
-            mimetype="application/json"
+        # Normalize numeric values for ID construction
+        def _n_int(val: Optional[float | int]) -> int:
+            try:
+                return int(round(float(val)))
+            except Exception:
+                return 0
+
+        synthetic_id = (
+            f"{firstname}:{_n_int(distance)}:{_n_int(moving_time)}:"
+            f"{_n_int(elapsed_time)}:{_n_int(total_elevation_gain)}"
         )
 
-    token_url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-        "grant_type": "authorization_code",
-    }
-    try:
-        resp = requests.post(token_url, data=payload, timeout=10)
-    except requests.RequestException as ex:
-        logging.exception("Network error exchanging Strava code")
-        return func.HttpResponse(
-            json.dumps({"error": "network_error", "detail": str(ex)}),
-            status_code=502,
-            mimetype="application/json"
-        )
+        # Choose partition key: prefer athlete_id, else athlete name
+        partition_key = str(athlete_id) if athlete_id is not None else (firstname or "unknown")
+        row_key = synthetic_id
 
-    if resp.status_code != 200:
-        logging.warning("Strava token exchange failed: status=%s body=%s", resp.status_code, resp.text[:500])
-        return func.HttpResponse(
-            json.dumps({"error": "strava_error", "status": resp.status_code, "body": resp.text[:200]}),
-            status_code=resp.status_code,
-            mimetype="application/json"
-        )
-
-    data = resp.json()
-    athlete = data.get("athlete", {}) or {}
-    athlete_id_raw = athlete.get("id")
-    if athlete_id_raw is None:
-        athlete_id = -1
-    else:
-        try:
-            athlete_id = int(athlete_id_raw)  # type: ignore[arg-type]
-        except Exception:
-            athlete_id = -1
-    store_tokens(athlete_id, data)
-
-    atok = (data.get("access_token") or "")
-    logging.info(
-        "Strava token exchange success athlete=%s expires_at=%s access_token_suffix=%s",
-        athlete_id,
-        data.get("expires_at"),
-        atok[-4:]
-    )
-
-    # Return friendly HTML (tokens are NOT exposed)
-    html_template = """<!doctype html>
-<html lang='en'>
-<head>
-    <meta charset='utf-8'/>
-    <title>Strava Connected</title>
-    <meta name='viewport' content='width=device-width,initial-scale=1'/>
-    <style>
-        :root {{ font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#222; background:#f5f7fa; }}
-        body {{ margin:0; padding:2rem; display:flex; align-items:center; justify-content:center; min-height:100vh; }}
-        .card {{ background:#fff; padding:2.25rem 2.5rem; border-radius:20px; max-width:560px; box-shadow:0 4px 24px -4px rgba(0,0,0,0.15); }}
-        h1 {{ margin-top:0; font-size:1.9rem; display:flex; align-items:center; gap:.6rem; }}
-        .logo {{ width:42px; height:42px; display:inline-block; }}
-        p {{ line-height:1.5; }}
-        code {{ background:#eef2f6; padding:.2rem .45rem; border-radius:4px; font-size:.85rem; }}
-        .meta {{ margin-top:1.25rem; font-size:.8rem; color:#555; }}
-    </style>
-</head>
-<body>
-    <div class='card'>
-        <h1>
-            <span class='logo'>
-                <svg viewBox='0 0 120 120' width='42' height='42' xmlns='http://www.w3.org/2000/svg'>
-                    <defs>
-                        <linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>
-                            <stop stop-color='#ff7e36'/>
-                            <stop offset='1' stop-color='#fc4c02'/>
-                        </linearGradient>
-                    </defs>
-                    <rect rx='24' width='120' height='120' fill='url(#g)'/>
-                    <path d='M60 22 32 78h16l12-25 12 25h16L60 22Z' fill='#fff' fill-rule='evenodd'/>
-                </svg>
-            </span>
-            Strava Connected to BSOD!
-        </h1>
-        <p>Your Strava account is now linked to the BSOD Discord bot. You can close this tab.</p>
-        <p>We'll post your activities automatically. If you ever want to revoke access, disconnect it in Strava's settings.</p>
-        <div class='meta'>Athlete ID: <code>{athlete_id}</code></div>
-    </div>
-</body>
-</html>"""
-    html = html_template.format(athlete_id=athlete_id)
-    return func.HttpResponse(html, status_code=200, mimetype="text/html")
-
-
-@app.route(route="refresh_token", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def refresh_token_endpoint(req: func.HttpRequest) -> func.HttpResponse:
-    """Manually trigger token refresh for an athlete (athlete_id in JSON or query).
-
-    NOTE: Consider securing this endpoint (e.g., function key / auth) before production.
-    """
-    athlete_id = None
-    try:
-        if req.method == "POST" and req.get_body():
-            body = json.loads(req.get_body())
-            athlete_id = body.get("athlete_id")
-    except Exception:
-        pass
-    if athlete_id is None:
-        athlete_id = req.params.get("athlete_id")
-    try:
-        athlete_id_int = int(athlete_id)
-    except Exception:
-        return func.HttpResponse(
-            json.dumps({"error": "invalid_or_missing_athlete_id"}),
-            status_code=400,
-            mimetype="application/json"
-        )
-    changed, entity = refresh_tokens(athlete_id_int)
-    if not entity:
-        return func.HttpResponse(json.dumps({"error": "not_found"}), status_code=404, mimetype="application/json")
-    response = {
-        "athlete_id": athlete_id_int,
-        "refreshed": changed,
-        "expires_at": entity.get("expires_at"),
-    }
-    return func.HttpResponse(json.dumps(response), status_code=200, mimetype="application/json")
-
-
-@app.route(route="deauthorize", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def deauthorize(req: func.HttpRequest) -> func.HttpResponse:
-    """Revoke Strava access and delete stored tokens.
-
-    Athlete id provided via JSON or query param. Calls Strava deauthorize endpoint.
-    """
-    athlete_id = None
-    try:
-        if req.get_body():
-            body = json.loads(req.get_body())
-            athlete_id = body.get("athlete_id")
-    except Exception:
-        pass
-    if athlete_id is None:
-        athlete_id = req.params.get("athlete_id")
-    try:
-        athlete_id_int = int(athlete_id)
-    except Exception:
-        return func.HttpResponse(json.dumps({"error": "invalid_or_missing_athlete_id"}), status_code=400)
-    entity = get_tokens(athlete_id_int)
-    if not entity:
-        return func.HttpResponse(json.dumps({"error": "not_found"}), status_code=404)
-    access_token = entity.get("access_token")
-    status = "skipped"
-    if access_token:
-        try:
-            resp = requests.post(
-                "https://www.strava.com/oauth/deauthorize",
-                params={"access_token": access_token},
-                timeout=10
+        table = _get_activities_table_client()
+        if table is None:
+            logging.warning(
+                "Table client not available; skipping persistence for activity by %s %s",
+                firstname,
+                lastname,
             )
-            status = f"{resp.status_code}"
-        except requests.RequestException:
-            logging.exception("Deauthorize request failed for athlete %s", athlete_id_int)
-            status = "network_error"
-    # Delete entity
-    table = _get_table_client()
-    if table:
+            return
+
+        # Flatten entity for Table Storage
+        entity = {
+            "PartitionKey": partition_key,
+            "RowKey": row_key,
+            # Core fields from the club activity payload
+            "name": activity.get("name"),
+            "distance": float(distance) if distance is not None else None,
+            "moving_time": int(moving_time) if moving_time is not None else None,
+            "elapsed_time": int(elapsed_time) if elapsed_time is not None else None,
+            "total_elevation_gain": float(total_elevation_gain) if total_elevation_gain is not None else None,
+            "type": activity.get("type"),  # deprecated but present
+            "sport_type": activity.get("sport_type"),
+            "workout_type": activity.get("workout_type"),
+            # Timestamps from Strava payload (strings)
+            "start_date": activity.get("start_date"),
+            "start_date_local": activity.get("start_date_local"),
+            "strava_updated_at": activity.get("updated_at"),
+            "club_activity_id": activity.get("id"),  # if Strava includes one
+            "club_id": os.getenv("STRAVA_CLUB_ID"),
+            # Flattened athlete
+            "athlete_id": athlete_id if athlete_id is not None else None,
+            "athlete_firstname": firstname or None,
+            "athlete_lastname": lastname or None,
+            "athlete_json": None,
+            # Bookkeeping
+            "source": "club",
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+        # Include athlete JSON if present
+        if athlete:
+            try:
+                import json as _json  # local import to avoid top-level dependency at cold start cost
+
+                entity["athlete_json"] = _json.dumps(athlete, ensure_ascii=False)
+            except Exception:
+                # best-effort only
+                pass
+
+        # Copy any additional simple scalar fields from the payload
+        for k, v in activity.items():
+            if k in entity or k == "athlete":
+                continue
+            if isinstance(v, (str, int, float, bool)) and len(k) < 255:
+                # Avoid overwriting our bookkeeping names
+                safe_key = k if k not in {"PartitionKey", "RowKey"} else f"strava_{k}"
+                entity.setdefault(safe_key, v)
+
+        # Remove keys with value None (Table Storage doesn't accept None)
+        entity = {k: v for k, v in entity.items() if v is not None}
+
+        table.upsert_entity(entity=entity, mode="merge")
+
+        logging.info(
+            "Upserted club activity by %s %s: %s (PK=%s RK=%s)",
+            firstname,
+            lastname,
+            entity.get("name"),
+            partition_key,
+            row_key,
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("Failed processing club activity")
+
+
+def _get_activities_table_client() -> Optional[TableClient]:
+    """Create or return a TableClient for the StravaActivities table using Managed Identity.
+
+    Expects:
+    - AzureWebJobsStorage__tableServiceUri
+    - Optional: AzureWebJobsStorage__clientId (for user-assigned managed identity)
+    - Optional: STRAVA_ACTIVITIES_TABLE (defaults to 'StravaActivities')
+    """
+    try:
+        table_service_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
+        if not table_service_uri:
+            logging.error("AzureWebJobsStorage__tableServiceUri not set; cannot access Table Storage")
+            return None
+
+        client_id = (
+            os.getenv("AzureWebJobsStorage__clientId")
+            or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
+            or os.getenv("AZURE_CLIENT_ID")
+        )
+        credential = ManagedIdentityCredential(client_id=client_id) if client_id else ManagedIdentityCredential()
+
+        service = TableServiceClient(endpoint=table_service_uri, credential=credential)
+        table_name = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+        # Ensure table exists
         try:
-            table.delete_entity(partition_key="athlete", row_key=str(athlete_id_int))
-            logging.info("Deleted tokens for athlete %s", athlete_id_int)
-        except Exception:
-            logging.exception("Failed deleting entity for athlete %s", athlete_id_int)
-            return func.HttpResponse(json.dumps({"error": "delete_failed", "deauth_status": status}), status_code=500)
-    return func.HttpResponse(json.dumps({"athlete_id": athlete_id_int, "deauth_status": status}), status_code=200)
+            service.create_table_if_not_exists(table_name=table_name)
+        except Exception:  # table may already exist or lack permission to create
+            pass
+        return service.get_table_client(table_name=table_name)
+    except Exception:
+        logging.exception("Failed to create TableClient for activities")
+        return None
 
 
