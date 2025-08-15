@@ -5,6 +5,10 @@ from datetime import datetime, timezone
 import azure.functions as func
 import requests
 from azure.data.tables import TableServiceClient, UpdateMode
+try:
+    from azure.identity import DefaultAzureCredential  # type: ignore
+except ImportError:  # azure-identity optional until installed
+    DefaultAzureCredential = None  # type: ignore
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -13,24 +17,43 @@ TABLE_NAME = os.getenv("STRAVA_TOKENS_TABLE", "StravaTokens")
 
 
 def _get_table_client():
-    """Return table client using AzureWebJobsStorage connection string.
+    """Return a TableClient for the tokens table using managed identity.
 
-    Creates table if it does not exist. Returns None if storage not configured.
+    Only supports connection-stringless access via AzureWebJobsStorage__tableServiceUri
+    and a system or user-assigned managed identity with 'Storage Table Data Contributor'.
     """
-    conn = os.getenv("AzureWebJobsStorage") or os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    if not conn:
-        logging.error("Storage connection string not configured; cannot persist tokens.")
-        return None
-    try:
-        svc = TableServiceClient.from_connection_string(conn)
+    table_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
+    if table_uri:
+        if DefaultAzureCredential is None:
+            logging.error(
+                "azure-identity not installed; cannot use identity-based storage access. "
+                "Install azure-identity to use AzureWebJobsStorage__tableServiceUri."
+            )
+            return None
         try:
-            svc.create_table_if_not_exists(TABLE_NAME)
-        except Exception:  # table may already exist
-            pass  # noqa: BLE001
-        return svc.get_table_client(TABLE_NAME)
-    except Exception:
-        logging.exception("Failed to create TableServiceClient")
-        return None
+            # Support user-assigned managed identity by allowing explicit client ID env var
+            # Azure Functions sets MSI_ENDPOINT / IDENTITY_ENDPOINT automatically for system identity.
+            # For user-assigned identities, set AZURE_CLIENT_ID (preferred) or USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID.
+            user_client_id = (
+                os.getenv("AZURE_CLIENT_ID")
+                or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
+            )
+            if user_client_id:
+                cred = DefaultAzureCredential(managed_identity_client_id=user_client_id)
+            else:
+                cred = DefaultAzureCredential()
+            svc = TableServiceClient(endpoint=table_uri, credential=cred)
+            try:
+                svc.create_table_if_not_exists(TABLE_NAME)
+            except Exception:  # noqa: BLE001
+                pass
+            return svc.get_table_client(TABLE_NAME)
+        except Exception:  # noqa: BLE001
+            logging.exception("Failed identity TableServiceClient initialization")
+            return None
+
+    logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
+    return None
 
 
 def store_tokens(athlete_id: int, data: dict):
@@ -239,33 +262,46 @@ def token_exchange(req: func.HttpRequest) -> func.HttpResponse:
     )
 
     # Return friendly HTML (tokens are NOT exposed)
-    html_template = (
-        "<!doctype html>\n"
-        "<html lang='en'>\n<head>\n  <meta charset='utf-8'/>\n  <title>Strava Connected</title>\n"
-        "  <meta name='viewport' content='width=device-width,initial-scale=1'/>\n  <style>\n"
-        "    :root { font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
-        " color:#222; background:#f5f7fa; }\n"
-        "    body { margin:0; padding:2rem; display:flex; align-items:center; justify-content:center;"
-        " min-height:100vh; }\n"
-        "    .card { background:#fff; padding:2.25rem 2.5rem; border-radius:20px; max-width:560px;"
-        " box-shadow:0 4px 24px -4px rgba(0,0,0,0.15); }\n"
-        "    h1 { margin-top:0; font-size:1.9rem; display:flex; align-items:center; gap:.6rem; }\n"
-        "    .logo { width:42px; height:42px; display:inline-block; }\n"
-        "    p { line-height:1.5; }\n"
-        "    code { background:#eef2f6; padding:.2rem .45rem; border-radius:4px; font-size:.85rem; }\n"
-        "    .meta { margin-top:1.25rem; font-size:.8rem; color:#555; }\n"
-        "  </style>\n</head>\n<body>\n  <div class='card'>\n    <h1>\n      <span class='logo'>\n"
-        "        <svg viewBox='0 0 120 120' width='42' height='42' xmlns='http://www.w3.org/2000/svg'>\n"
-        "          <defs>\n            <linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>\n"
-        "              <stop stop-color='#ff7e36'/>\n              <stop offset='1' stop-color='#fc4c02'/>\n"
-        "            </linearGradient>\n          </defs>\n"
-        "          <rect rx='24' width='120' height='120' fill='url(#g)'/>\n"
-        "          <path d='M60 22 32 78h16l12-25 12 25h16L60 22Z' fill='#fff' fill-rule='evenodd'/>\n"
-        "        </svg>\n      </span>\n      Strava Connected\n    </h1>\n"
-        "    <p>Your Strava account is now linked. You can close this tab.</p>\n"
-        "    <p>We'll post your activities automatically. If you ever want to revoke access, disconnect it in Strava's settings.</p>\n"
-        "    <div class='meta'>Athlete ID: <code>{athlete_id}</code></div>\n  </div>\n</body>\n</html>"
-    )
+    html_template = """<!doctype html>
+<html lang='en'>
+<head>
+    <meta charset='utf-8'/>
+    <title>Strava Connected</title>
+    <meta name='viewport' content='width=device-width,initial-scale=1'/>
+    <style>
+        :root {{ font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#222; background:#f5f7fa; }}
+        body {{ margin:0; padding:2rem; display:flex; align-items:center; justify-content:center; min-height:100vh; }}
+        .card {{ background:#fff; padding:2.25rem 2.5rem; border-radius:20px; max-width:560px; box-shadow:0 4px 24px -4px rgba(0,0,0,0.15); }}
+        h1 {{ margin-top:0; font-size:1.9rem; display:flex; align-items:center; gap:.6rem; }}
+        .logo {{ width:42px; height:42px; display:inline-block; }}
+        p {{ line-height:1.5; }}
+        code {{ background:#eef2f6; padding:.2rem .45rem; border-radius:4px; font-size:.85rem; }}
+        .meta {{ margin-top:1.25rem; font-size:.8rem; color:#555; }}
+    </style>
+</head>
+<body>
+    <div class='card'>
+        <h1>
+            <span class='logo'>
+                <svg viewBox='0 0 120 120' width='42' height='42' xmlns='http://www.w3.org/2000/svg'>
+                    <defs>
+                        <linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>
+                            <stop stop-color='#ff7e36'/>
+                            <stop offset='1' stop-color='#fc4c02'/>
+                        </linearGradient>
+                    </defs>
+                    <rect rx='24' width='120' height='120' fill='url(#g)'/>
+                    <path d='M60 22 32 78h16l12-25 12 25h16L60 22Z' fill='#fff' fill-rule='evenodd'/>
+                </svg>
+            </span>
+            Strava Connected
+        </h1>
+        <p>Your Strava account is now linked. You can close this tab.</p>
+        <p>We'll post your activities automatically. If you ever want to revoke access, disconnect it in Strava's settings.</p>
+        <div class='meta'>Athlete ID: <code>{athlete_id}</code></div>
+    </div>
+</body>
+</html>"""
     html = html_template.format(athlete_id=athlete_id)
     return func.HttpResponse(html, status_code=200, mimetype="text/html")
 
