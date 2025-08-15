@@ -237,7 +237,7 @@ def _process_club_activity(activity: dict) -> None:
         except (requests.RequestException, ValueError, OSError):
             logging.exception("Discord post/edit failed")
 
-        logging.info(
+        logging.debug(
             "Upserted club activity by %s %s: %s (PK=%s RK=%s)",
             firstname,
             lastname,
