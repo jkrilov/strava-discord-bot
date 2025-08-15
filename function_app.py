@@ -369,7 +369,7 @@ def _seconds_to_minutes(seconds: Any) -> Optional[int]:
         return None
 
 
-def _build_discord_content(entity: Dict[str, Any]) -> str:
+def _build_discord_content(entity: Dict[str, Any], include_separator: bool = False) -> str:
     firstname = entity.get("athlete_firstname") or ""
     lastname = entity.get("athlete_lastname") or ""
     athlete_name = (f"{firstname} {lastname}").strip() or "Someone"
@@ -377,7 +377,8 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     name = entity.get("name") or entity.get("sport_type") or entity.get("type") or "Workout"
     sport = (entity.get("sport_type") or entity.get("type") or "").strip()
 
-    miles = _meters_to_miles(entity.get("distance"))
+    distance_m = entity.get("distance")
+    miles = _meters_to_miles(distance_m)
     moving_secs_val = entity.get("moving_time")
     mins = _seconds_to_minutes(moving_secs_val)
 
@@ -416,9 +417,18 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     lines.append(f"🔥 {athlete_name}")
     lines.append(f"{sport_emoji(sport)} {name}")
 
-    # Include distance if meaningful
-    if miles is not None and miles >= 0.05:
-        lines.append(f"📏 {miles:.2f} mi")
+    # Include distance: swims stay in meters; others in miles
+    is_swim = "Swim" in sport
+    is_ride = "Ride" in sport
+    if is_swim:
+        try:
+            if distance_m is not None and float(distance_m) > 0:
+                lines.append(f"📏 {int(round(float(distance_m)))} m")
+        except (TypeError, ValueError):
+            pass
+    else:
+        if miles is not None and miles >= 0.05:
+            lines.append(f"📏 {miles:.2f} mi")
 
     # Include moving time when available
     if mins is not None and mins > 0:
@@ -430,8 +440,18 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
         return any(x in s for x in ["Run", "Walk", "Hike"])  # Run/TrailRun/Walk/Hike
 
     try:
-        if miles is not None and miles >= 0.1 and isinstance(moving_secs_val, (int, float)) and moving_secs_val > 0:
-            if _is_pace_sport(sport):
+        if isinstance(moving_secs_val, (int, float)) and moving_secs_val > 0:
+            if is_swim and distance_m is not None and float(distance_m) > 0:
+                # Pace per 100m
+                secs_per_100m = float(moving_secs_val) / (float(distance_m) / 100.0)
+                pace_min = int(secs_per_100m // 60)
+                pace_sec = int(round(secs_per_100m % 60))
+                if pace_sec == 60:
+                    pace_min += 1
+                    pace_sec = 0
+                lines.append(f"🏁 {pace_min}:{pace_sec:02d} /100m")
+            elif miles is not None and miles >= 0.1 and _is_pace_sport(sport):
+                # Pace for run/walk/hike
                 secs_per_mile = float(moving_secs_val) / float(miles)
                 pace_min = int(secs_per_mile // 60)
                 pace_sec = int(round(secs_per_mile % 60))
@@ -439,6 +459,22 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
                     pace_min += 1
                     pace_sec = 0
                 lines.append(f"🏁 {pace_min}:{pace_sec:02d} /mi")
+            elif is_ride:
+                # Speed for rides (mph)
+                mph = None
+                if miles is not None and miles > 0.05:
+                    hours = float(moving_secs_val) / 3600.0
+                    if hours > 0:
+                        mph = float(miles) / hours
+                if mph is None:
+                    avg_mps = entity.get("average_speed")
+                    try:
+                        if avg_mps is not None:
+                            mph = float(avg_mps) * 2.2369362920544
+                    except (TypeError, ValueError):
+                        mph = None
+                if mph is not None and mph > 0.5:
+                    lines.append(f"⚡ {mph:.1f} mph")
     except (TypeError, ValueError):
         pass
 
@@ -455,7 +491,7 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
         add_sep = os.getenv("DISCORD_ADD_SEPARATOR", "true").lower() == "true"
     except Exception:
         add_sep = True
-    if add_sep:
+    if include_separator and add_sep:
         try:
             # Append a separator starting from the second post
             if _RUN_POST_COUNT >= 1:
@@ -476,8 +512,9 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
 
     edit_updates = os.getenv("DISCORD_EDIT_UPDATES", "true").lower() == "true"
 
-    content = _build_discord_content(entity)
-    if not content:
+    # Build a base content used for storage and comparisons (no per-run separator)
+    base_content = _build_discord_content(entity, include_separator=False)
+    if not base_content:
         return
 
     existing_content = entity.get("discord_content")
@@ -487,15 +524,37 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
     if message_id and not edit_updates:
         return
 
-    if edit_updates and message_id and existing_content:
+    if edit_updates and message_id and existing_content is not None:
         # Edit existing message if content changed
-        if content == existing_content:
+        if base_content == existing_content:
             return
+        # Log a concise diff to diagnose why we edit
+        try:
+            old_lines = str(existing_content).splitlines()
+            new_lines = str(base_content).splitlines()
+            first_diff_idx = None
+            for i in range(min(len(old_lines), len(new_lines))):
+                if old_lines[i] != new_lines[i]:
+                    first_diff_idx = i
+                    break
+            if first_diff_idx is None and len(old_lines) != len(new_lines):
+                first_diff_idx = min(len(old_lines), len(new_lines))
+            if first_diff_idx is not None:
+                logging.info(
+                    "Discord edit: first diff at line %s | old='%s' | new='%s'",
+                    first_diff_idx,
+                    (old_lines[first_diff_idx] if first_diff_idx < len(old_lines) else "<no line>")[:160],
+                    (new_lines[first_diff_idx] if first_diff_idx < len(new_lines) else "<no line>")[:160],
+                )
+            else:
+                logging.info("Discord edit: content changed (no line diff found, possibly whitespace)")
+        except Exception:
+            pass
         base = webhook_url.split("?")[0].rstrip("/")
         edit_url = f"{base}/messages/{message_id}"
-        resp = requests.patch(edit_url, json={"content": content}, timeout=15)
+        resp = requests.patch(edit_url, json={"content": base_content}, timeout=15)
         if resp.status_code in (200, 204):
-            entity["discord_content"] = content
+            entity["discord_content"] = base_content
             entity["discord_updated_at"] = datetime.now(timezone.utc)
             table.upsert_entity(entity=entity, mode="merge")
         else:
@@ -504,7 +563,9 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
 
     # Post new message and capture message id with wait=true
     wait_url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
-    resp = requests.post(wait_url, json={"content": content}, timeout=15)
+    # For new posts we may include a separator visually, but we keep base_content in storage
+    posted_content = _build_discord_content(entity, include_separator=True)
+    resp = requests.post(wait_url, json={"content": posted_content}, timeout=15)
     if resp.status_code in (200, 204):
         try:
             body = resp.json() if resp.status_code == 200 else {}
@@ -512,7 +573,7 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
             body = {}
         msg_id = body.get("id")
         entity["discord_message_id"] = msg_id
-        entity["discord_content"] = content
+        entity["discord_content"] = base_content
         entity["discord_posted_at"] = datetime.now(timezone.utc)
         table.upsert_entity(entity=entity, mode="merge")
         # Increment per-run post counter on successful new post
