@@ -6,9 +6,9 @@ import azure.functions as func
 import requests
 from azure.data.tables import TableServiceClient, UpdateMode
 try:
-    from azure.identity import DefaultAzureCredential  # type: ignore
+    from azure.identity import ManagedIdentityCredential  # type: ignore
 except ImportError:  # azure-identity optional until installed
-    DefaultAzureCredential = None  # type: ignore
+    ManagedIdentityCredential = None  # type: ignore
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -24,24 +24,25 @@ def _get_table_client():
     """
     table_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
     if table_uri:
-        if DefaultAzureCredential is None:
+        if ManagedIdentityCredential is None:
             logging.error(
-                "azure-identity not installed; cannot use identity-based storage access. "
+                "azure-identity not installed; cannot use managed identity for Table Storage. "
                 "Install azure-identity to use AzureWebJobsStorage__tableServiceUri."
             )
             return None
         try:
-            # Support user-assigned managed identity by allowing explicit client ID env var
-            # Azure Functions sets MSI_ENDPOINT / IDENTITY_ENDPOINT automatically for system identity.
-            # For user-assigned identities, set AZURE_CLIENT_ID (preferred) or USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID.
+            # Use only ManagedIdentityCredential to avoid noisy DefaultAzureCredential chain when running locally.
             user_client_id = (
-                os.getenv("AZURE_CLIENT_ID")
+                os.getenv("AzureWebJobsStorage__clientId")
+                or os.getenv("AZURE_CLIENT_ID")
                 or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
             )
             if user_client_id:
-                cred = DefaultAzureCredential(managed_identity_client_id=user_client_id)
+                logging.info("Using user-assigned managed identity (client_id ending ...%s) for Table access", user_client_id[-6:])
+                cred = ManagedIdentityCredential(client_id=user_client_id)
             else:
-                cred = DefaultAzureCredential()
+                logging.info("Using system-assigned managed identity for Table access")
+                cred = ManagedIdentityCredential()
             svc = TableServiceClient(endpoint=table_uri, credential=cred)
             try:
                 svc.create_table_if_not_exists(TABLE_NAME)
@@ -49,7 +50,15 @@ def _get_table_client():
                 pass
             return svc.get_table_client(TABLE_NAME)
         except Exception:  # noqa: BLE001
-            logging.exception("Failed identity TableServiceClient initialization")
+            if user_client_id:
+                logging.exception(
+                    "Managed identity auth failed for user-assigned identity. Ensure: (1) Identity is assigned to the Function App, "
+                    "(2) 'Storage Table Data Contributor' role on the storage account, (3) AZURE_CLIENT_ID matches the identity's client ID."
+                )
+            else:
+                logging.exception(
+                    "Managed identity auth failed for system-assigned identity. Ensure identity is enabled on the Function App and has 'Storage Table Data Contributor' on the storage account."
+                )
             return None
 
     logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
