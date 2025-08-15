@@ -7,6 +7,7 @@ import azure.functions as func
 import requests
 from azure.identity import ManagedIdentityCredential
 from azure.data.tables import TableServiceClient, TableClient
+from azure.core.exceptions import AzureError
 
 app = func.FunctionApp()
 
@@ -59,7 +60,7 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
                         # updated_at/start_date are ISO-8601; compare to after_ts
                         ts = int(datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp())
                         keep = ts >= after_ts
-                    except Exception:
+                    except (ValueError, TypeError, OverflowError):
                         keep = True
                 if not keep:
                     continue
@@ -187,7 +188,7 @@ def _process_club_activity(activity: dict) -> None:
             partition_key,
             row_key,
         )
-    except Exception:  # noqa: BLE001
+    except (AzureError, ValueError, TypeError, OSError):
         logging.exception("Failed processing club activity")
 
 
@@ -217,11 +218,15 @@ def _get_activities_table_client() -> Optional[TableClient]:
         # Ensure table exists
         try:
             service.create_table_if_not_exists(table_name=table_name)
-        except Exception:  # table may already exist or lack permission to create
+        except AzureError:
+            # table may already exist or lack permission to create
             pass
         return service.get_table_client(table_name=table_name)
-    except Exception:
-        logging.exception("Failed to create TableClient for activities")
+    except AzureError:
+        logging.exception("Failed to create TableClient for activities (Azure error)")
+        return None
+    except OSError:
+        logging.exception("Failed to create TableClient for activities (OS error)")
         return None
 
 
