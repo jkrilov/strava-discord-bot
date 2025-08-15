@@ -14,6 +14,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
 TABLE_NAME = os.getenv("STRAVA_TOKENS_TABLE", "StravaTokens")
+ACTIVITIES_TABLE_NAME = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
 
 
 def _get_table_client():
@@ -63,6 +64,42 @@ def _get_table_client():
 
     logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
     return None
+
+
+def _get_table_client_for(table_name: str):
+    """Return a TableClient for the given table using managed identity.
+
+    Expects AzureWebJobsStorage__tableServiceUri and (optionally) AzureWebJobsStorage__clientId.
+    """
+    table_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
+    if not table_uri:
+        logging.error("AzureWebJobsStorage__tableServiceUri not configured; cannot access Table Storage.")
+        return None
+    if ManagedIdentityCredential is None:
+        logging.error(
+            "azure-identity not installed; cannot use managed identity for Table Storage. "
+            "Install azure-identity to use AzureWebJobsStorage__tableServiceUri."
+        )
+        return None
+    user_client_id = (
+        os.getenv("AzureWebJobsStorage__clientId")
+        or os.getenv("AZURE_CLIENT_ID")
+        or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
+    )
+    try:
+        if user_client_id:
+            cred = ManagedIdentityCredential(client_id=user_client_id)
+        else:
+            cred = ManagedIdentityCredential()
+        svc = TableServiceClient(endpoint=table_uri, credential=cred)
+        try:
+            svc.create_table_if_not_exists(table_name)
+        except Exception:  # noqa: BLE001
+            pass
+        return svc.get_table_client(table_name)
+    except Exception:  # noqa: BLE001
+        logging.exception("Failed to initialize Table client for %s", table_name)
+        return None
 
 
 def store_tokens(athlete_id: int, data: dict):
@@ -194,9 +231,98 @@ def strava_webhook_events(req: func.HttpRequest) -> func.HttpResponse:
         aspect, obj_type, obj_id, owner_id
     )
 
-    # Processing placeholder: fetch activity details via Strava API and forward to Discord webhook.
+    # Handle activity events: upsert into StravaActivities; fetch details for create/update when possible.
+    if obj_type == "activity" and obj_id and owner_id:
+        try:
+            activity_id = int(obj_id)
+            athlete_id = int(owner_id)
+        except Exception:
+            activity_id = None
+            athlete_id = None
+        if activity_id is not None and athlete_id is not None:
+            details = None
+            if aspect in {"create", "update"}:
+                # Ensure we have a valid token and try to get full activity details
+                try:
+                    _ = refresh_tokens(athlete_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                details = _fetch_activity_details(athlete_id, activity_id)
+            _upsert_activity_event(athlete_id, activity_id, aspect, payload, details)
 
     return func.HttpResponse("OK", status_code=200)
+
+
+def _fetch_activity_details(athlete_id: int, activity_id: int):
+    """Fetch activity details from Strava using stored tokens. Returns dict or None."""
+    entity = get_tokens(athlete_id)
+    if not entity:
+        return None
+    access_token = entity.get("access_token")
+    if not access_token:
+        return None
+    url = f"https://www.strava.com/api/v3/activities/{activity_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+    except requests.RequestException:
+        logging.exception("Failed to fetch activity %s for athlete %s", activity_id, athlete_id)
+        return None
+    if resp.status_code != 200:
+        logging.warning("Fetch activity failed id=%s status=%s body=%s", activity_id, resp.status_code, resp.text[:200])
+        return None
+    try:
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _upsert_activity_event(
+    athlete_id: int,
+    activity_id: int,
+    aspect: str,
+    payload: dict,
+    details: dict | None,
+):
+    """Upsert the activity row in the activities table with event and optional detail fields."""
+    table = _get_table_client_for(ACTIVITIES_TABLE_NAME)
+    if not table:
+        return
+    entity: dict = {
+        "PartitionKey": str(athlete_id),
+        "RowKey": str(activity_id),
+        "object_type": payload.get("object_type"),
+        "aspect_type": aspect,
+        "event_time": int(payload.get("event_time") or 0),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    updates = payload.get("updates") or {}
+    if updates:
+        try:
+            entity["updates_json"] = json.dumps(updates)
+        except Exception:  # noqa: BLE001
+            pass
+    if aspect == "delete":
+        entity["deleted"] = True
+    # Map selected details if provided
+    if details:
+        def _maybe_set(k: str, v):
+            if v is not None:
+                entity[k] = v
+        _maybe_set("name", details.get("name"))
+        _maybe_set("sport_type", details.get("sport_type") or details.get("type"))
+        _maybe_set("distance", details.get("distance"))
+        _maybe_set("moving_time", details.get("moving_time"))
+        _maybe_set("elapsed_time", details.get("elapsed_time"))
+        _maybe_set("start_date", details.get("start_date"))
+        _maybe_set("start_date_local", details.get("start_date_local"))
+        _maybe_set("private", details.get("private"))
+        _maybe_set("visibility", details.get("visibility"))
+    try:
+        table.upsert_entity(entity, mode=UpdateMode.MERGE)
+        logging.info("Upserted activity %s for athlete %s (aspect=%s)", activity_id, athlete_id, aspect)
+    except Exception:  # noqa: BLE001
+        logging.exception("Failed to upsert activity %s for athlete %s", activity_id, athlete_id)
 
 
 @app.route(route="token_exchange", methods=["GET"])
@@ -315,7 +441,7 @@ def token_exchange(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(html, status_code=200, mimetype="text/html")
 
 
-@app.route(route="refresh_token", methods=["POST"])
+@app.route(route="refresh_token", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def refresh_token_endpoint(req: func.HttpRequest) -> func.HttpResponse:
     """Manually trigger token refresh for an athlete (athlete_id in JSON or query).
 
@@ -349,7 +475,7 @@ def refresh_token_endpoint(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps(response), status_code=200, mimetype="application/json")
 
 
-@app.route(route="deauthorize", methods=["POST"])
+@app.route(route="deauthorize", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def deauthorize(req: func.HttpRequest) -> func.HttpResponse:
     """Revoke Strava access and delete stored tokens.
 
