@@ -182,6 +182,24 @@ def _process_club_activity(activity: dict) -> None:
             "updated_at": datetime.now(timezone.utc),
         }
 
+        # Load existing entity to preserve Discord fields for dedupe/edit logic
+        try:
+            existing = table.get_entity(partition_key=partition_key, row_key=row_key)
+        except AzureError:
+            existing = None
+        except Exception:
+            existing = None
+
+        if isinstance(existing, dict):
+            for k in (
+                "discord_message_id",
+                "discord_content",
+                "discord_posted_at",
+                "discord_updated_at",
+            ):
+                if existing.get(k) is not None and entity.get(k) is None:
+                    entity[k] = existing.get(k)
+
         # Include athlete JSON if present
         if athlete:
             try:
@@ -363,6 +381,23 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     moving_secs_val = entity.get("moving_time")
     mins = _seconds_to_minutes(moving_secs_val)
 
+    def workout_type_label(sport_name: str, wt: Any) -> Optional[str]:
+        # Normalize
+        try:
+            code = int(wt) if wt is not None and str(wt).strip() != "" else None
+        except (TypeError, ValueError):
+            code = None
+        if code is None:
+            return None
+        s = sport_name or ""
+        is_run = s in ("Run", "TrailRun")
+        is_ride = "Ride" in s and s not in ("Run", "TrailRun")
+        if is_run:
+            return {1: "Race", 2: "Long Run", 3: "Workout"}.get(code)
+        if is_ride:
+            return {10: "Race", 11: "Workout"}.get(code)
+        return None
+
     def sport_emoji(s: str) -> str:
         m = {
             "Run": "🏃",
@@ -407,9 +442,13 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     except (TypeError, ValueError):
         pass
 
-    # Always include sport label
+    # Always include sport label, and append workout type mapping when available
     if sport:
-        lines.append(f"🏅 {sport}")
+        wt_label = workout_type_label(sport, entity.get("workout_type"))
+        if wt_label:
+            lines.append(f"🏅 {sport} - {wt_label}")
+        else:
+            lines.append(f"🏅 {sport}")
 
     # Optional separator for multi-activity runs
     try:
