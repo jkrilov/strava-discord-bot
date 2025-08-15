@@ -96,11 +96,17 @@ def _process_club_activity(activity: dict) -> None:
         total_elevation_gain = activity.get("total_elevation_gain")
 
         # Normalize numeric values for ID construction
-        def _n_int(val: Optional[float | int]) -> int:
-            try:
-                return int(round(float(val)))
-            except Exception:
+        def _n_int(val: object) -> int:
+            if val is None:
                 return 0
+            if isinstance(val, (int, float)):
+                return int(round(float(val)))
+            if isinstance(val, str) and val.strip():
+                try:
+                    return int(round(float(val)))
+                except ValueError:
+                    return 0
+            return 0
 
         synthetic_id = (
             f"{firstname}:{_n_int(distance)}:{_n_int(moving_time)}:"
