@@ -351,26 +351,43 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     athlete_name = (f"{firstname} {lastname}").strip() or "Someone"
 
     name = entity.get("name") or entity.get("sport_type") or entity.get("type") or "Workout"
-    sport = entity.get("sport_type") or entity.get("type")
+    sport = (entity.get("sport_type") or entity.get("type") or "").strip()
 
     miles = _meters_to_miles(entity.get("distance"))
     mins = _seconds_to_minutes(entity.get("moving_time"))
 
-    parts: list[str] = [f"{athlete_name}: {name}"]
+    def sport_emoji(s: str) -> str:
+        m = {
+            "Run": "🏃",
+            "Ride": "🚴",
+            "Walk": "🚶",
+            "Hike": "🥾",
+            "Swim": "🏊",
+            "Workout": "🏋️",
+            "WeightTraining": "🏋️",
+            "Yoga": "🧘",
+            "Rowing": "🚣",
+        }
+        return m.get(s, "🏅") if s else "🏅"
+
+    lines: list[str] = []
+    lines.append(f"🔥 {athlete_name}")
+    lines.append(f"{sport_emoji(sport)} {name}")
 
     # Include distance if meaningful
     if miles is not None and miles >= 0.05:
-        parts.append(f"{miles:.2f} mi")
+        lines.append(f"📏 {miles:.2f} mi")
 
-    # Always include moving time when available
+    # Include moving time when available
     if mins is not None and mins > 0:
-        parts.append(f"{mins} min")
+        lines.append(f"⏱️ {mins} min")
 
-    if sport and sport not in {"Run", "Ride", "Walk"}:
-        parts.append(f"({sport})")
+    # Always include sport label
+    if sport:
+        lines.append(f"🏅 {sport}")
 
-    content = " - ".join(parts)
-    # Discord limit is 2000 chars; keep it short
+    content = "\n".join(lines)
+    # Discord limit is 2000 chars; keep buffer for safety
     return content[:1800]
 
 
