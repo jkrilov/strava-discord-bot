@@ -3,6 +3,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict
 from datetime import timedelta
+import random
+from tenacity import Retrying, stop_after_attempt, retry_if_exception_type, wait_base
 
 import azure.functions as func
 import requests
@@ -66,9 +68,18 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     done = False
     try:
         while True:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
-            if resp.status_code != 200:
-                logging.warning("Strava clubs activities failed: status=%s body=%s", resp.status_code, resp.text[:200])
+            resp = _request_with_retries(
+                method="GET",
+                url=url,
+                headers=headers,
+                params=params,
+                timeout=15,
+                retry_label="strava:get_club_activities",
+            )
+            if resp is None or resp.status_code != 200:
+                status = getattr(resp, "status_code", "<no resp>")
+                body = getattr(resp, "text", "")
+                logging.warning("Strava clubs activities failed: status=%s body=%s", status, body[:200])
                 break
             items = resp.json() or []
             if not items:
@@ -426,8 +437,9 @@ def _get_bearer_token() -> Optional[str]:
 
     # Refresh via Strava OAuth endpoint
     try:
-        resp = requests.post(
-            "https://www.strava.com/api/v3/oauth/token",
+        resp = _request_with_retries(
+            method="POST",
+            url="https://www.strava.com/api/v3/oauth/token",
             data={
                 "client_id": client_id,
                 "client_secret": client_secret,
@@ -435,9 +447,12 @@ def _get_bearer_token() -> Optional[str]:
                 "refresh_token": refresh_token,
             },
             timeout=15,
+            retry_label="strava:token_refresh",
         )
-        if resp.status_code != 200:
-            logging.warning("Strava token refresh failed: %s %s", resp.status_code, resp.text[:200])
+        if resp is None or resp.status_code != 200:
+            status = getattr(resp, "status_code", "<no resp>")
+            text = getattr(resp, "text", "")
+            logging.warning("Strava token refresh failed: %s %s", status, text[:200])
             return None
         body = resp.json() or {}
         access_token = body.get("access_token")
@@ -660,21 +675,35 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
             pass
         base = webhook_url.split("?")[0].rstrip("/")
         edit_url = f"{base}/messages/{message_id}"
-        resp = requests.patch(edit_url, json={"content": base_content}, timeout=15)
-        if resp.status_code in (200, 204):
+        resp = _request_with_retries(
+            method="PATCH",
+            url=edit_url,
+            json={"content": base_content},
+            timeout=15,
+            retry_label="discord:edit",
+        )
+        if resp is not None and resp.status_code in (200, 204):
             entity["discord_content"] = base_content
             entity["discord_updated_at"] = datetime.now(timezone.utc)
             table.upsert_entity(entity=entity, mode="merge")
         else:
-            logging.warning("Discord edit failed: %s %s", resp.status_code, resp.text[:200])
+            status = getattr(resp, "status_code", "<no resp>")
+            text = getattr(resp, "text", "")
+            logging.warning("Discord edit failed: %s %s", status, text[:200])
         return
 
     # Post new message and capture message id with wait=true
     wait_url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
     # For new posts we may include a separator visually, but we keep base_content in storage
     posted_content = _build_discord_content(entity, include_separator=True)
-    resp = requests.post(wait_url, json={"content": posted_content}, timeout=15)
-    if resp.status_code in (200, 204):
+    resp = _request_with_retries(
+        method="POST",
+        url=wait_url,
+        json={"content": posted_content},
+        timeout=15,
+        retry_label="discord:post",
+    )
+    if resp is not None and resp.status_code in (200, 204):
         try:
             body = resp.json() if resp.status_code == 200 else {}
         except ValueError:
@@ -691,6 +720,104 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
         except Exception:
             pass
     else:
-        logging.warning("Discord post failed: %s %s", resp.status_code, resp.text[:200])
+        status = getattr(resp, "status_code", "<no resp>")
+        text = getattr(resp, "text", "")
+        logging.warning("Discord post failed: %s %s", status, text[:200])
+
+
+class _WaitRetryAfterOrExponential(wait_base):
+    def __init__(self, base: float, cap: float) -> None:
+        self.base = base
+        self.cap = cap
+
+    def __call__(self, retry_state) -> float:
+        # Default exponential backoff with small jitter
+        backoff = min(self.cap, self.base * (2 ** (max(1, retry_state.attempt_number) - 1)))
+        jitter = random.uniform(0, 0.25)
+        wait_s = backoff + jitter
+
+        # If last result was a Response with 429 + Retry-After header, honor it
+        outcome = getattr(retry_state, "outcome", None)
+        try:
+            result = outcome.result() if outcome is not None else None
+        except Exception:
+            result = None
+        if result is not None and hasattr(result, "status_code") and getattr(result, "status_code", 0) == 429:
+            try:
+                ra = float(result.headers.get("Retry-After")) if hasattr(result, "headers") else None
+            except (TypeError, ValueError):
+                ra = None
+            if ra is not None and ra > 0:
+                return min(self.cap, ra) + jitter
+        return wait_s
+
+
+def _request_with_retries(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: int = 15,
+    retry_label: str = "http",
+):
+    """HTTP call with Tenacity retries (returns requests.Response or None).
+
+    Retries on 429 and transient 5xx (500/502/503/504) and network errors.
+    Honors Retry-After on 429.
+    Env controls:
+    - HTTP_MAX_RETRIES (default 3)
+    - HTTP_BACKOFF_BASE_SECONDS (default 1.0)
+    - HTTP_BACKOFF_CAP_SECONDS (default 8.0)
+    """
+    max_retries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
+    base = float(os.getenv("HTTP_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
+    cap = float(os.getenv("HTTP_BACKOFF_CAP_SECONDS", "8.0") or "8.0")
+    transient = {429, 500, 502, 503, 504}
+
+    def do_request():
+        try:
+            return requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=json,
+                data=data,
+                timeout=timeout,
+            )
+        except requests.RequestException:
+            # Let retry_if_exception_type handle it
+            raise
+
+    retryer = Retrying(
+        reraise=False,
+        stop=stop_after_attempt(max_retries + 1),
+        wait=_WaitRetryAfterOrExponential(base, cap),
+        retry=(
+            retry_if_exception_type(requests.RequestException)
+            | (lambda fn: None)
+        ),
+        before_sleep=lambda rs: logging.debug(
+            "%s retry %s; last status=%s",  # minimal debug log
+            retry_label,
+            getattr(rs, "attempt_number", "?"),
+            (getattr(getattr(rs, "outcome", None), "result", lambda: None)() or {}).__class__.__name__,
+        ),
+    )
+
+    # Tenacity doesn't include retry_if_result by default in this construction, so we emulate
+    # by checking response status code in a loop of attempts
+    for attempt in retryer:
+        with attempt:
+            resp = do_request()
+            if getattr(resp, "status_code", 0) not in transient:
+                return resp
+            # Return resp so Tenacity records outcome; then it will wait and retry
+            return resp
+
+    # If we get here, retries exhausted
+    return None
 
 

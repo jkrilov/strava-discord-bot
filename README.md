@@ -24,12 +24,10 @@ Azure Functions (Python 3.12) app that polls a Strava club feed on a schedule an
 Required:
 - `STRAVA_CLUB_ID` — Club ID to poll
 - `STRAVA_ACCESS_TOKEN` — Token that can read the club feed
-- `AzureWebJobsStorage__tableServiceUri` — `https://<storage>.table.core.windows.net`
 
 Optional:
 - `STRAVA_SINCE_SECONDS` — Recent window in seconds (default: `3600`)
 - `STRAVA_ACTIVITIES_TABLE` — Table name (default: `StravaActivities`)
-- `AzureWebJobsStorage__clientId` — Client ID for a user-assigned managed identity
 - `DISCORD_WEBHOOK_URL` — Discord webhook to post activity summaries (if set)
 - `DISCORD_EDIT_UPDATES` — `true`/`false`; when `true`, edits prior messages if the summary changes (default: `true`). Set `false` to always post new messages.
 - `STRAVA_PER_PAGE` — Page size for club feed (default: `50`)
