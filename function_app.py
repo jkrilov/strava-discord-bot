@@ -18,6 +18,9 @@ _TOKEN_CACHE: Dict[str, Any] = {
     "refresh_token": None,
 }
 
+# Per-run counter for Discord posts to optionally add separators
+_RUN_POST_COUNT: int = 0
+
 
 @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
 def collect_club_activities(myTimer: func.TimerRequest) -> None:
@@ -30,6 +33,9 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     - STRAVA_SINCE_SECONDS: Optional; only fetch activities updated in the last N seconds (default: 3600)
     """
     utc_now = datetime.now(timezone.utc)
+    # Reset per-run counter for Discord posts
+    global _RUN_POST_COUNT
+    _RUN_POST_COUNT = 0
     logging.info("collect_club_activities invoked at %s", utc_now.isoformat())
 
     club_id = os.getenv("STRAVA_CLUB_ID")
@@ -405,6 +411,20 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     if sport:
         lines.append(f"🏅 {sport}")
 
+    # Optional separator for multi-activity runs
+    try:
+        add_sep = os.getenv("DISCORD_ADD_SEPARATOR", "true").lower() == "true"
+    except Exception:
+        add_sep = True
+    if add_sep:
+        try:
+            # Append a separator starting from the second post
+            if _RUN_POST_COUNT >= 1:
+                lines.append("────────")
+        except NameError:
+            # Counter not initialized; ignore
+            pass
+
     content = "\n".join(lines)
     # Discord limit is 2000 chars; keep buffer for safety
     return content[:1800]
@@ -423,6 +443,10 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
 
     existing_content = entity.get("discord_content")
     message_id = entity.get("discord_message_id")
+
+    # If a message already exists and edits are disabled, skip to prevent duplicates
+    if message_id and not edit_updates:
+        return
 
     if edit_updates and message_id and existing_content:
         # Edit existing message if content changed
@@ -452,6 +476,12 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
         entity["discord_content"] = content
         entity["discord_posted_at"] = datetime.now(timezone.utc)
         table.upsert_entity(entity=entity, mode="merge")
+        # Increment per-run post counter on successful new post
+        try:
+            global _RUN_POST_COUNT
+            _RUN_POST_COUNT += 1
+        except Exception:
+            pass
     else:
         logging.warning("Discord post failed: %s %s", resp.status_code, resp.text[:200])
 
