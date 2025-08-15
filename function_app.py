@@ -303,9 +303,9 @@ def token_exchange(req: func.HttpRequest) -> func.HttpResponse:
                     <path d='M60 22 32 78h16l12-25 12 25h16L60 22Z' fill='#fff' fill-rule='evenodd'/>
                 </svg>
             </span>
-            Strava Connected
+            Strava Connected to BSOD!
         </h1>
-        <p>Your Strava account is now linked. You can close this tab.</p>
+        <p>Your Strava account is now linked to the BSOD Discord bot. You can close this tab.</p>
         <p>We'll post your activities automatically. If you ever want to revoke access, disconnect it in Strava's settings.</p>
         <div class='meta'>Athlete ID: <code>{athlete_id}</code></div>
     </div>
