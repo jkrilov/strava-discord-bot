@@ -31,6 +31,7 @@ Optional:
 - `STRAVA_ACTIVITIES_TABLE` — Table name (default: `StravaActivities`)
 - `AzureWebJobsStorage__clientId` — Client ID for a user-assigned managed identity
 - `DISCORD_WEBHOOK_URL` — Discord webhook to post activity summaries (if set)
+- `DISCORD_EDIT_UPDATES` — `true`/`false`; when `true`, edits prior messages if the summary changes (default: `true`). Set `false` to always post new messages.
 - `STRAVA_PER_PAGE` — Page size for club feed (default: `50`)
 - `STRAVA_MAX_PAGES` — Max pages fetched each run (default: `10`)
 - `STRAVA_USE_TIME_FILTER` — `true`/`false`; when `true`, attempts time filtering using `updated_at`/`start_date` (default: `true`)
@@ -70,7 +71,7 @@ Table: `StravaActivities`
 - Discord posting is enabled when `DISCORD_WEBHOOK_URL` is set:
   - Converts meters→miles and seconds→minutes.
   - Skips distance display when < 0.05 miles (e.g., weight training).
-  - Posts new messages and edits prior messages if the activity name or summary changes.
+  - Posts new messages and edits prior messages if the activity name or summary changes (can be disabled with `DISCORD_EDIT_UPDATES=false`).
 - Persist a cursor (last seen timestamp) to further reduce duplicates.
 - Add tests and structured logging.
 

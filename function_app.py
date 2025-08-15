@@ -354,7 +354,8 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     sport = (entity.get("sport_type") or entity.get("type") or "").strip()
 
     miles = _meters_to_miles(entity.get("distance"))
-    mins = _seconds_to_minutes(entity.get("moving_time"))
+    moving_secs_val = entity.get("moving_time")
+    mins = _seconds_to_minutes(moving_secs_val)
 
     def sport_emoji(s: str) -> str:
         m = {
@@ -382,6 +383,24 @@ def _build_discord_content(entity: Dict[str, Any]) -> str:
     if mins is not None and mins > 0:
         lines.append(f"⏱️ {mins} min")
 
+    # Add pace for relevant sports when distance/time are meaningful
+    def _is_pace_sport(s: str) -> bool:
+        s = s or ""
+        return any(x in s for x in ["Run", "Walk", "Hike"])  # Run/TrailRun/Walk/Hike
+
+    try:
+        if miles is not None and miles >= 0.1 and isinstance(moving_secs_val, (int, float)) and moving_secs_val > 0:
+            if _is_pace_sport(sport):
+                secs_per_mile = float(moving_secs_val) / float(miles)
+                pace_min = int(secs_per_mile // 60)
+                pace_sec = int(round(secs_per_mile % 60))
+                if pace_sec == 60:
+                    pace_min += 1
+                    pace_sec = 0
+                lines.append(f"🏁 {pace_min}:{pace_sec:02d} /mi")
+    except (TypeError, ValueError):
+        pass
+
     # Always include sport label
     if sport:
         lines.append(f"🏅 {sport}")
@@ -396,6 +415,8 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
     if not webhook_url:
         return
 
+    edit_updates = os.getenv("DISCORD_EDIT_UPDATES", "true").lower() == "true"
+
     content = _build_discord_content(entity)
     if not content:
         return
@@ -403,7 +424,7 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
     existing_content = entity.get("discord_content")
     message_id = entity.get("discord_message_id")
 
-    if message_id and existing_content:
+    if edit_updates and message_id and existing_content:
         # Edit existing message if content changed
         if content == existing_content:
             return
