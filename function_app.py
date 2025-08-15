@@ -2,6 +2,7 @@ import os
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict
+from datetime import timedelta
 
 import azure.functions as func
 import requests
@@ -196,6 +197,7 @@ def _process_club_activity(activity: dict) -> None:
                 "discord_content",
                 "discord_posted_at",
                 "discord_updated_at",
+                "created_at",
             ):
                 if existing.get(k) is not None and entity.get(k) is None:
                     entity[k] = existing.get(k)
@@ -219,6 +221,10 @@ def _process_club_activity(activity: dict) -> None:
                 safe_key = k if k not in {"PartitionKey", "RowKey"} else f"strava_{k}"
                 entity.setdefault(safe_key, v)
 
+        # Initialize created_at if missing
+        if entity.get("created_at") is None:
+            entity["created_at"] = datetime.now(timezone.utc)
+
         # Remove keys with value None (Table Storage doesn't accept None)
         entity = {k: v for k, v in entity.items() if v is not None}
 
@@ -241,6 +247,108 @@ def _process_club_activity(activity: dict) -> None:
         )
     except (AzureError, ValueError, TypeError, OSError):
         logging.exception("Failed processing club activity")
+
+
+def _to_utc_iso(dt: datetime) -> str:
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Compaction removed: storage is minimal; we simply delete old entities in cleanup.
+
+
+@app.timer_trigger(schedule="0 0 4 * * *", arg_name="cleanupTimer")
+def cleanup_old_entities(cleanupTimer: func.TimerRequest) -> None:
+    """Daily cleanup: delete activities older than retention.
+
+    Env:
+    - STRAVA_DELETE_AFTER_DAYS: delete entities older than this (default 180)
+    - STRAVA_CLEANUP_MAX: max entities to process per run (default 500)
+    """
+    try:
+        table = _get_activities_table_client()
+        if table is None:
+            return
+
+        delete_days = int(os.getenv("STRAVA_DELETE_AFTER_DAYS", "180") or "180")
+        max_ops = int(os.getenv("STRAVA_CLEANUP_MAX", "500") or "500")
+        if delete_days <= 0:
+            return
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=delete_days)
+        cutoff_iso = _to_utc_iso(cutoff)
+
+        processed = 0
+        # Prefer created_at; fallback to updated_at if created_at missing
+        filter_created = f"created_at lt datetime'{cutoff_iso}'"
+        filter_updated = f"updated_at lt datetime'{cutoff_iso}' and (created_at eq null)"
+
+        try:
+            # Delete by created_at first
+            for page in table.list_entities(results_per_page=1000, query_filter=filter_created).by_page():
+                for e in page:
+                    try:
+                        pk = e.get("PartitionKey")
+                        rk = e.get("RowKey")
+                        if not pk or not rk:
+                            continue
+                        table.delete_entity(partition_key=pk, row_key=rk)
+                        processed += 1
+                        if processed >= max_ops:
+                            raise StopIteration
+                    except StopIteration:
+                        raise
+                    except AzureError:
+                        logging.exception(
+                            "Cleanup: failed to delete entity PK=%s RK=%s (created_at)",
+                            e.get("PartitionKey"),
+                            e.get("RowKey"),
+                        )
+                    except Exception:
+                        logging.exception("Cleanup: unexpected error during deletion (created_at)")
+        except StopIteration:
+            pass
+        except AzureError:
+            logging.exception("Cleanup: query for deletion by created_at failed")
+
+        # If capacity remains, delete by updated_at for legacy rows without created_at
+        if processed < max_ops:
+            remaining = max_ops - processed
+            try:
+                for page in table.list_entities(results_per_page=1000, query_filter=filter_updated).by_page():
+                    for e in page:
+                        try:
+                            pk = e.get("PartitionKey")
+                            rk = e.get("RowKey")
+                            if not pk or not rk:
+                                continue
+                            table.delete_entity(partition_key=pk, row_key=rk)
+                            processed += 1
+                            if processed >= max_ops or processed >= remaining:
+                                raise StopIteration
+                        except StopIteration:
+                            raise
+                        except AzureError:
+                            logging.exception(
+                                "Cleanup: failed to delete entity PK=%s RK=%s (updated_at)",
+                                e.get("PartitionKey"),
+                                e.get("RowKey"),
+                            )
+                        except Exception:
+                            logging.exception("Cleanup: unexpected error during deletion (updated_at)")
+            except StopIteration:
+                pass
+            except AzureError:
+                logging.exception("Cleanup: query for deletion by updated_at failed")
+
+        logging.info("Cleanup completed: deleted=%s", processed)
+    except Exception:
+        logging.exception("Cleanup: fatal error")
 
 
 def _get_activities_table_client() -> Optional[TableClient]:
