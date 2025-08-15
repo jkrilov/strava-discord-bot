@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import azure.functions as func
 import requests
@@ -10,6 +10,13 @@ from azure.data.tables import TableServiceClient, TableClient
 from azure.core.exceptions import AzureError
 
 app = func.FunctionApp()
+
+# Simple in-memory token cache for refresh-token flow
+_TOKEN_CACHE: Dict[str, Any] = {
+    "access_token": None,
+    "expires_at": 0,
+    "refresh_token": None,
+}
 
 
 @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
@@ -26,10 +33,13 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     logging.info("collect_club_activities invoked at %s", utc_now.isoformat())
 
     club_id = os.getenv("STRAVA_CLUB_ID")
-    token = os.getenv("STRAVA_ACCESS_TOKEN")
+    token = _get_bearer_token()
     since_window = int(os.getenv("STRAVA_SINCE_SECONDS", "3600"))
     if not club_id or not token:
-        logging.error("Missing STRAVA_CLUB_ID or STRAVA_ACCESS_TOKEN; skipping run")
+        logging.error(
+            "Missing STRAVA_CLUB_ID or token; set STRAVA_ACCESS_TOKEN or "
+            "STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET/STRAVA_REFRESH_TOKEN",
+        )
         return
 
     headers = {"Authorization": f"Bearer {token}"}
@@ -224,6 +234,74 @@ def _get_activities_table_client() -> Optional[TableClient]:
         return service.get_table_client(table_name=table_name)
     except AzureError:
         logging.exception("Failed to create TableClient for activities (Azure error)")
+        return None
+
+
+def _get_bearer_token() -> Optional[str]:
+    """Return a Strava bearer token.
+
+    Preference order:
+    1) STRAVA_ACCESS_TOKEN (direct)
+    2) Refresh-token flow using STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
+    """
+    direct = os.getenv("STRAVA_ACCESS_TOKEN")
+    if direct:
+        return direct
+
+    client_id = os.getenv("STRAVA_CLIENT_ID")
+    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
+    refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        return None
+
+    # Use cache if still valid for at least 60 seconds
+    now = int(datetime.now(timezone.utc).timestamp())
+    try:
+        cached_token = _TOKEN_CACHE.get("access_token")
+        exp_val: Any = _TOKEN_CACHE.get("expires_at")
+        if isinstance(exp_val, (int, float, str)):
+            try:
+                cached_exp = int(exp_val)
+            except (TypeError, ValueError):
+                cached_exp = 0
+        else:
+            cached_exp = 0
+        cached_rt = _TOKEN_CACHE.get("refresh_token")
+    except Exception:
+        cached_token = None
+        cached_exp = 0
+        cached_rt = None
+
+    if cached_token and cached_exp - now > 60 and cached_rt == refresh_token:
+        return str(cached_token)
+
+    # Refresh via Strava OAuth endpoint
+    try:
+        resp = requests.post(
+            "https://www.strava.com/api/v3/oauth/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logging.warning("Strava token refresh failed: %s %s", resp.status_code, resp.text[:200])
+            return None
+        body = resp.json() or {}
+        access_token = body.get("access_token")
+        expires_at = int(body.get("expires_at") or 0)
+        new_refresh = body.get("refresh_token") or refresh_token
+        if not access_token:
+            return None
+        _TOKEN_CACHE["access_token"] = access_token
+        _TOKEN_CACHE["expires_at"] = expires_at
+        _TOKEN_CACHE["refresh_token"] = new_refresh
+        return access_token
+    except requests.RequestException:
+        logging.exception("Failed to refresh Strava access token")
         return None
     except OSError:
         logging.exception("Failed to create TableClient for activities (OS error)")
