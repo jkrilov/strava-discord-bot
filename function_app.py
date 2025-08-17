@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 from typing import Optional, Any, Dict
 from datetime import timedelta
 import random
-from tenacity import Retrying, stop_after_attempt, retry_if_exception_type, wait_base
+from tenacity import (
+    Retrying,
+    stop_after_attempt,
+    retry_if_exception_type,
+    retry_if_result,
+    wait_base,
+)
 
 import azure.functions as func
 import requests
@@ -13,6 +19,33 @@ from azure.data.tables import TableServiceClient, TableClient
 from azure.core.exceptions import AzureError
 
 app = func.FunctionApp()
+
+# Shared HTTP session for connection reuse
+_HTTP = requests.Session()
+
+# Small env helpers
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return default
+    return v
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # Simple in-memory token cache for refresh-token flow
 _TOKEN_CACHE: Dict[str, Any] = {
@@ -33,7 +66,7 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     - STRAVA_CLUB_ID: The Strava club ID to poll
     - STRAVA_ACCESS_TOKEN: A personal access token or app token authorized to read club activities
       (From a Strava account with access to the club)
-    - STRAVA_SINCE_SECONDS: Optional; only fetch activities updated in the last N seconds (default: 3600)
+    - STRAVA_SINCE_SECONDS: Only fetch activities updated in the last N seconds; set 0 to disable (default: 3600)
     """
     utc_now = datetime.now(timezone.utc)
     # Reset per-run counter for Discord posts
@@ -41,13 +74,13 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     _RUN_POST_COUNT = 0
     logging.info("collect_club_activities invoked at %s", utc_now.isoformat())
 
-    club_id = os.getenv("STRAVA_CLUB_ID")
+    club_id = _env_str("STRAVA_CLUB_ID")
     token = _get_bearer_token()
-    since_window = int(os.getenv("STRAVA_SINCE_SECONDS", "3600"))
-    per_page = int(os.getenv("STRAVA_PER_PAGE", "50") or "50")
-    max_pages = int(os.getenv("STRAVA_MAX_PAGES", "10") or "10")
-    max_items = int(os.getenv("STRAVA_MAX_ACTIVITIES", "0") or "0")  # 0 = unlimited
-    use_time_filter = (os.getenv("STRAVA_USE_TIME_FILTER", "true").lower() == "true")
+    since_window = _env_int("STRAVA_SINCE_SECONDS", 3600)
+    per_page = _env_int("STRAVA_PER_PAGE", 50)
+    max_pages = _env_int("STRAVA_MAX_PAGES", 10)
+    max_items = _env_int("STRAVA_MAX_ACTIVITIES", 0)  # 0 = unlimited
+    use_time_filter = since_window > 0
     if not club_id or not token:
         logging.error(
             "Missing STRAVA_CLUB_ID or token; set STRAVA_ACCESS_TOKEN or "
@@ -59,13 +92,14 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
     # Strava club activities endpoint
     url = f"https://www.strava.com/api/v3/clubs/{club_id}/activities"
 
-    # Optional since filtering: Strava supports 'after' (unix timestamp) for some endpoints; for clubs
-    # endpoint, we'll page and filter client-side on 'start_date' or 'updated_at' if present.
-    after_ts = int((utc_now.timestamp()) - since_window)
+    # Since filtering: page and filter client-side on 'start_date' or 'updated_at' if present.
+    after_ts = int((utc_now.timestamp()) - since_window) if use_time_filter else 0
     params = {"per_page": per_page, "page": 1}
 
     collected = 0
+    skipped_time = 0
     done = False
+    pages_fetched = 0
     try:
         while True:
             resp = _request_with_retries(
@@ -81,6 +115,7 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
                 body = getattr(resp, "text", "")
                 logging.warning("Strava clubs activities failed: status=%s body=%s", status, body[:200])
                 break
+            pages_fetched += 1
             items = resp.json() or []
             if not items:
                 break
@@ -96,23 +131,42 @@ def collect_club_activities(myTimer: func.TimerRequest) -> None:
                     except (ValueError, TypeError, OverflowError):
                         keep = True
                 if not keep:
+                    skipped_time += 1
                     continue
                 collected += 1
                 _process_club_activity(act)
                 if max_items > 0 and collected >= max_items:
+                    logging.info(
+                        "Reached STRAVA_MAX_ACTIVITIES=%s after page=%s; stopping early",
+                        max_items,
+                        params.get("page"),
+                    )
                     done = True
                     break
+            if done:
+                break
             # Next page
             params["page"] += 1
             # Safety: avoid chasing too far if within small window
             if params["page"] > max_pages:
                 break
-            if done:
-                break
     except requests.RequestException:
         logging.exception("Network error fetching club activities")
 
-    logging.info("Collected %s activities for club %s", collected, club_id)
+    logging.info(
+        (
+            "Collected %s activities for club %s (skipped_by_time=%s, pages=%s, per_page=%s, "
+            "max_pages=%s, max_items=%s, since_seconds=%s)"
+        ),
+        collected,
+        club_id,
+        skipped_time,
+        pages_fetched,
+        per_page,
+        max_pages,
+        max_items,
+        since_window,
+    )
 
 
 def _process_club_activity(activity: dict) -> None:
@@ -371,20 +425,20 @@ def _get_activities_table_client() -> Optional[TableClient]:
     - Optional: STRAVA_ACTIVITIES_TABLE (defaults to 'StravaActivities')
     """
     try:
-        table_service_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
+        table_service_uri = _env_str("AzureWebJobsStorage__tableServiceUri")
         if not table_service_uri:
             logging.error("AzureWebJobsStorage__tableServiceUri not set; cannot access Table Storage")
             return None
 
         client_id = (
-            os.getenv("AzureWebJobsStorage__clientId")
-            or os.getenv("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
-            or os.getenv("AZURE_CLIENT_ID")
+            _env_str("AzureWebJobsStorage__clientId")
+            or _env_str("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
+            or _env_str("AZURE_CLIENT_ID")
         )
         credential = ManagedIdentityCredential(client_id=client_id) if client_id else ManagedIdentityCredential()
 
         service = TableServiceClient(endpoint=table_service_uri, credential=credential)
-        table_name = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+        table_name = _env_str("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
         # Ensure table exists
         try:
             service.create_table_if_not_exists(table_name=table_name)
@@ -492,7 +546,9 @@ def _seconds_to_minutes(seconds: Any) -> Optional[int]:
         return None
 
 
-def _build_discord_content(entity: Dict[str, Any], include_separator: bool = False) -> str:
+def _build_discord_content(
+    entity: Dict[str, Any], include_separator: bool = False, run_post_count: int = 0
+) -> str:
     firstname = entity.get("athlete_firstname") or ""
     lastname = entity.get("athlete_lastname") or ""
     athlete_name = (f"{firstname} {lastname}").strip() or "Someone"
@@ -610,14 +666,10 @@ def _build_discord_content(entity: Dict[str, Any], include_separator: bool = Fal
             lines.append(f"🏅 {sport}")
 
     # Optional separator for multi-activity runs
-    try:
-        add_sep = os.getenv("DISCORD_ADD_SEPARATOR", "true").lower() == "true"
-    except Exception:
-        add_sep = True
-    if include_separator and add_sep:
+    if include_separator:
         try:
             # Append a separator starting from the second post
-            if _RUN_POST_COUNT >= 1:
+            if run_post_count >= 1:
                 lines.append("────────")
         except NameError:
             # Counter not initialized; ignore
@@ -636,7 +688,7 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
     edit_updates = os.getenv("DISCORD_EDIT_UPDATES", "true").lower() == "true"
 
     # Build a base content used for storage and comparisons (no per-run separator)
-    base_content = _build_discord_content(entity, include_separator=False)
+    base_content = _build_discord_content(entity, include_separator=False, run_post_count=_RUN_POST_COUNT)
     if not base_content:
         return
 
@@ -695,7 +747,7 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
     # Post new message and capture message id with wait=true
     wait_url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
     # For new posts we may include a separator visually, but we keep base_content in storage
-    posted_content = _build_discord_content(entity, include_separator=True)
+    posted_content = _build_discord_content(entity, include_separator=True, run_post_count=_RUN_POST_COUNT)
     resp = _request_with_retries(
         method="POST",
         url=wait_url,
@@ -768,17 +820,15 @@ def _request_with_retries(
     Honors Retry-After on 429.
     Env controls:
     - HTTP_MAX_RETRIES (default 3)
-    - HTTP_BACKOFF_BASE_SECONDS (default 1.0)
-    - HTTP_BACKOFF_CAP_SECONDS (default 8.0)
     """
     max_retries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
-    base = float(os.getenv("HTTP_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
-    cap = float(os.getenv("HTTP_BACKOFF_CAP_SECONDS", "8.0") or "8.0")
+    base = 1.0
+    cap = 8.0
     transient = {429, 500, 502, 503, 504}
 
     def do_request():
         try:
-            return requests.request(
+            return _HTTP.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -791,19 +841,21 @@ def _request_with_retries(
             # Let retry_if_exception_type handle it
             raise
 
+    def _last_status_code(rs) -> str:
+        try:
+            outcome = getattr(rs, "outcome", None)
+            res = outcome.result() if outcome is not None else None
+            return str(getattr(res, "status_code", "n/a"))
+        except Exception:
+            return "n/a"
+
     retryer = Retrying(
         reraise=False,
         stop=stop_after_attempt(max_retries + 1),
         wait=_WaitRetryAfterOrExponential(base, cap),
         retry=(
             retry_if_exception_type(requests.RequestException)
-            | (lambda fn: None)
-        ),
-        before_sleep=lambda rs: logging.debug(
-            "%s retry %s; last status=%s",  # minimal debug log
-            retry_label,
-            getattr(rs, "attempt_number", "?"),
-            (getattr(getattr(rs, "outcome", None), "result", lambda: None)() or {}).__class__.__name__,
+            | retry_if_result(lambda r: getattr(r, "status_code", 0) in transient)
         ),
     )
 
@@ -812,9 +864,7 @@ def _request_with_retries(
     for attempt in retryer:
         with attempt:
             resp = do_request()
-            if getattr(resp, "status_code", 0) not in transient:
-                return resp
-            # Return resp so Tenacity records outcome; then it will wait and retry
+            # Return response; retry_if_result will decide whether to retry on transient codes
             return resp
 
     # If we get here, retries exhausted
