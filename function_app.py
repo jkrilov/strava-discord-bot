@@ -221,16 +221,34 @@ def fetch_club_activities(access_token: str) -> list:
 
 
 def get_table_client() -> Optional[TableClient]:
-    """Get Azure Table Storage client using managed identity."""
+    """Get Azure Table Storage client using user-assigned managed identity."""
     try:
         table_service_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
         table_name = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+        client_id = os.getenv("AzureWebJobsStorage__clientId")
 
         if not table_service_uri:
-            logging.error("AzureWebJobsStorage__tableServiceUri not set")
+            logging.error("AzureWebJobsStorage__tableServiceUri not set", extra={
+                "operation": "get_table_client",
+                "error_type": "missing_config"
+            })
             return None
 
-        credential = ManagedIdentityCredential()
+        if not client_id:
+            logging.error("AzureWebJobsStorage__clientId not set", extra={
+                "operation": "get_table_client",
+                "error_type": "missing_client_id"
+            })
+            return None
+
+        logging.debug("Creating table client with user-assigned managed identity", extra={
+            "operation": "get_table_client",
+            "table_service_uri": table_service_uri,
+            "table_name": table_name,
+            "client_id": client_id
+        })
+
+        credential = ManagedIdentityCredential(client_id=client_id)
         service_client = TableServiceClient(
             endpoint=table_service_uri,
             credential=credential
@@ -239,10 +257,21 @@ def get_table_client() -> Optional[TableClient]:
         # Ensure table exists
         service_client.create_table_if_not_exists(table_name=table_name)
 
-        return service_client.get_table_client(table_name=table_name)
+        table_client = service_client.get_table_client(table_name=table_name)
+        
+        logging.info("Successfully created table client", extra={
+            "operation": "get_table_client",
+            "table_name": table_name
+        })
+
+        return table_client
 
     except Exception as e:
-        logging.error(f"Failed to create table client: {e}")
+        logging.error(f"Failed to create table client: {e}", extra={
+            "operation": "get_table_client",
+            "error_type": "creation_failed",
+            "exception": str(e)
+        }, exc_info=True)
         return None
 
 
