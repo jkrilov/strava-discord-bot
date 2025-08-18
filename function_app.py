@@ -1,889 +1,382 @@
 import os
 import logging
+import hashlib
 from datetime import datetime, timezone
-from typing import Optional, Any, Dict
-from datetime import timedelta
-import random
-from tenacity import (
-    Retrying,
-    stop_after_attempt,
-    retry_if_exception_type,
-    retry_if_result,
-    wait_base,
-)
+from typing import Optional, Dict, Any
 
 import azure.functions as func
 import requests
 from azure.identity import ManagedIdentityCredential
 from azure.data.tables import TableServiceClient, TableClient
 from azure.core.exceptions import AzureError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 app = func.FunctionApp()
 
-# Shared HTTP session for connection reuse
-_HTTP = requests.Session()
-
-# Small env helpers
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(str(v).strip())
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None or (isinstance(v, str) and v.strip() == ""):
-        return default
-    return v
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return bool(default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-# Simple in-memory token cache for refresh-token flow
-_TOKEN_CACHE: Dict[str, Any] = {
-    "access_token": None,
-    "expires_at": 0,
-    "refresh_token": None,
-}
-
-# Per-run counter for Discord posts to optionally add separators
-_RUN_POST_COUNT: int = 0
+# Strava OAuth token cache
+_token_cache = {"access_token": None, "expires_at": 0}
 
 
 @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
-def collect_club_activities(myTimer: func.TimerRequest) -> None:
-    """Timer runs every 5 minutes to collect latest activities for a Strava club.
-
-    Env vars required:
-    - STRAVA_CLUB_ID: The Strava club ID to poll
-    - STRAVA_ACCESS_TOKEN: A personal access token or app token authorized to read club activities
-      (From a Strava account with access to the club)
-    - STRAVA_SINCE_SECONDS: Only fetch activities updated in the last N seconds; set 0 to disable (default: 3600)
-    """
-    utc_now = datetime.now(timezone.utc)
-    # Reset per-run counter for Discord posts
-    global _RUN_POST_COUNT
-    _RUN_POST_COUNT = 0
-    logging.info("collect_club_activities invoked at %s", utc_now.isoformat())
-
-    club_id = _env_str("STRAVA_CLUB_ID")
-    token = _get_bearer_token()
-    since_window = _env_int("STRAVA_SINCE_SECONDS", 3600)
-    per_page = _env_int("STRAVA_PER_PAGE", 50)
-    max_pages = _env_int("STRAVA_MAX_PAGES", 10)
-    max_items = _env_int("STRAVA_MAX_ACTIVITIES", 0)  # 0 = unlimited
-    use_time_filter = since_window > 0
-    if not club_id or not token:
-        logging.error(
-            "Missing STRAVA_CLUB_ID or token; set STRAVA_ACCESS_TOKEN or "
-            "STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET/STRAVA_REFRESH_TOKEN",
-        )
-        return
-
-    headers = {"Authorization": f"Bearer {token}"}
-    # Strava club activities endpoint
-    url = f"https://www.strava.com/api/v3/clubs/{club_id}/activities"
-
-    # Since filtering: page and filter client-side on 'start_date' or 'updated_at' if present.
-    after_ts = int((utc_now.timestamp()) - since_window) if use_time_filter else 0
-    params = {"per_page": per_page, "page": 1}
-
-    collected = 0
-    skipped_time = 0
-    done = False
-    pages_fetched = 0
+def poll_strava_activities(myTimer: func.TimerRequest) -> None:
+    """Poll Strava club activities every 5 minutes and post to Discord."""
+    logging.info("Starting Strava club activities poll")
+    
     try:
-        while True:
-            resp = _request_with_retries(
-                method="GET",
-                url=url,
-                headers=headers,
-                params=params,
-                timeout=15,
-                retry_label="strava:get_club_activities",
-            )
-            if resp is None or resp.status_code != 200:
-                status = getattr(resp, "status_code", "<no resp>")
-                body = getattr(resp, "text", "")
-                logging.warning("Strava clubs activities failed: status=%s body=%s", status, body[:200])
-                break
-            pages_fetched += 1
-            items = resp.json() or []
-            if not items:
-                break
-            for act in items:
-                # Filter by time window if possible
-                updated = act.get("updated_at") or act.get("start_date")
-                keep = True
-                if use_time_filter and updated:
-                    try:
-                        # updated_at/start_date are ISO-8601; compare to after_ts
-                        ts = int(datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp())
-                        keep = ts >= after_ts
-                    except (ValueError, TypeError, OverflowError):
-                        keep = True
-                if not keep:
-                    skipped_time += 1
-                    continue
-                collected += 1
-                _process_club_activity(act)
-                if max_items > 0 and collected >= max_items:
-                    logging.info(
-                        "Reached STRAVA_MAX_ACTIVITIES=%s after page=%s; stopping early",
-                        max_items,
-                        params.get("page"),
-                    )
-                    done = True
-                    break
-            if done:
-                break
-            # Next page
-            params["page"] += 1
-            # Safety: avoid chasing too far if within small window
-            if params["page"] > max_pages:
-                break
-    except requests.RequestException:
-        logging.exception("Network error fetching club activities")
-
-    logging.info(
-        (
-            "Collected %s activities for club %s (skipped_by_time=%s, pages=%s, per_page=%s, "
-            "max_pages=%s, max_items=%s, since_seconds=%s)"
-        ),
-        collected,
-        club_id,
-        skipped_time,
-        pages_fetched,
-        per_page,
-        max_pages,
-        max_items,
-        since_window,
-    )
-
-
-def _process_club_activity(activity: dict) -> None:
-    """Handle a single club activity record.
-
-    Stores a flattened record into Azure Table Storage using a synthetic RowKey
-    because club activities do not include the activity ID.
-    """
-    try:
-        athlete = activity.get("athlete", {}) or {}
-        firstname = (athlete.get("firstname") or "").strip()
-        lastname = (athlete.get("lastname") or "").strip()
-        athlete_id = athlete.get("id")
-
-        # Build synthetic ID from requested fields; normalize floats to integers (meters) to avoid
-        # floating-point representation differences.
-        distance = activity.get("distance")
-        moving_time = activity.get("moving_time")
-        elapsed_time = activity.get("elapsed_time")
-        total_elevation_gain = activity.get("total_elevation_gain")
-
-        # Normalize numeric values for ID construction
-        def _n_int(val: object) -> int:
-            if val is None:
-                return 0
-            if isinstance(val, (int, float)):
-                return int(round(float(val)))
-            if isinstance(val, str) and val.strip():
-                try:
-                    return int(round(float(val)))
-                except ValueError:
-                    return 0
-            return 0
-
-        synthetic_id = (
-            f"{firstname}:{_n_int(distance)}:{_n_int(moving_time)}:"
-            f"{_n_int(elapsed_time)}:{_n_int(total_elevation_gain)}"
-        )
-
-        # Choose partition key: prefer athlete_id, else athlete name
-        partition_key = str(athlete_id) if athlete_id is not None else (firstname or "unknown")
-        row_key = synthetic_id
-
-        table = _get_activities_table_client()
-        if table is None:
-            logging.warning(
-                "Table client not available; skipping persistence for activity by %s %s",
-                firstname,
-                lastname,
-            )
+        # Get Strava access token
+        access_token = get_strava_token()
+        if not access_token:
+            logging.error("Failed to get Strava access token")
             return
+        
+        # Fetch club activities (first page only)
+        activities = fetch_club_activities(access_token)
+        if not activities:
+            logging.info("No activities found")
+            return
+        
+        # Get table client
+        table_client = get_table_client()
+        if not table_client:
+            logging.error("Failed to get table client")
+            return
+        
+        # Process each activity
+        for activity in activities:
+            process_activity(activity, table_client)
+        
+        logging.info(f"Processed {len(activities)} activities")
+        
+    except Exception as e:
+        logging.error(f"Error in poll_strava_activities: {e}")
 
-        # Flatten entity for Table Storage
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((requests.RequestException, AzureError))
+)
+def get_strava_token() -> Optional[str]:
+    """Get Strava access token using refresh token."""
+    global _token_cache
+    
+    # Check if cached token is still valid (with 5 minute buffer)
+    now = int(datetime.now(timezone.utc).timestamp())
+    if (_token_cache["access_token"] and
+            _token_cache["expires_at"] > now + 300):
+        return _token_cache["access_token"]
+    
+    # Refresh token
+    client_id = os.getenv("STRAVA_CLIENT_ID")
+    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
+    refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
+    
+    if not all([client_id, client_secret, refresh_token]):
+        logging.error("Missing Strava OAuth credentials")
+        return None
+    
+    response = requests.post(
+        "https://www.strava.com/api/v3/oauth/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token"
+        },
+        timeout=30
+    )
+    response.raise_for_status()
+    
+    data = response.json()
+    _token_cache["access_token"] = data["access_token"]
+    _token_cache["expires_at"] = data["expires_at"]
+    
+    return data["access_token"]
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(requests.RequestException)
+)
+def fetch_club_activities(access_token: str) -> list:
+    """Fetch first page of club activities from Strava."""
+    club_id = os.getenv("STRAVA_CLUB_ID")
+    if not club_id:
+        logging.error("STRAVA_CLUB_ID not set")
+        return []
+    
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(
+        f"https://www.strava.com/api/v3/clubs/{club_id}/activities",
+        headers=headers,
+        params={"page": 1, "per_page": 30},
+        timeout=30
+    )
+    response.raise_for_status()
+    
+    return response.json()
+
+
+def get_table_client() -> Optional[TableClient]:
+    """Get Azure Table Storage client using managed identity."""
+    try:
+        table_service_uri = os.getenv("AzureWebJobsStorage__tableServiceUri")
+        table_name = os.getenv("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+        
+        if not table_service_uri:
+            logging.error("AzureWebJobsStorage__tableServiceUri not set")
+            return None
+        
+        credential = ManagedIdentityCredential()
+        service_client = TableServiceClient(
+            endpoint=table_service_uri,
+            credential=credential
+        )
+        
+        # Ensure table exists
+        service_client.create_table_if_not_exists(table_name=table_name)
+        
+        return service_client.get_table_client(table_name=table_name)
+        
+    except Exception as e:
+        logging.error(f"Failed to create table client: {e}")
+        return None
+
+
+def create_activity_id(activity: Dict[str, Any]) -> str:
+    """Create unique ID from athlete name and activity metrics."""
+    athlete = activity.get("athlete", {})
+    athlete_name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+    
+    # Create hash from name + key metrics
+    data = f"{athlete_name}:{activity.get('distance', 0)}:{activity.get('moving_time', 0)}:{activity.get('elapsed_time', 0)}"
+    return hashlib.md5(data.encode()).hexdigest()
+
+
+def process_activity(activity: Dict[str, Any], table_client: TableClient) -> None:
+    """Process a single activity - check if new/changed and post/update Discord."""
+    try:
+        activity_id = create_activity_id(activity)
+        athlete = activity.get("athlete", {})
+        athlete_id = athlete.get("id", "unknown")
+        
+        # Check if activity exists in table
+        try:
+            existing_entity = table_client.get_entity(
+                partition_key=str(athlete_id),
+                row_key=activity_id
+            )
+        except AzureError:
+            existing_entity = None
+        
+        # Create/update entity
         entity = {
-            "PartitionKey": partition_key,
-            "RowKey": row_key,
-            # Core fields from the club activity payload
-            "name": activity.get("name"),
-            "distance": float(distance) if distance is not None else None,
-            "moving_time": int(moving_time) if moving_time is not None else None,
-            "elapsed_time": int(elapsed_time) if elapsed_time is not None else None,
-            "total_elevation_gain": float(total_elevation_gain) if total_elevation_gain is not None else None,
-            "type": activity.get("type"),  # deprecated but present
+            "PartitionKey": str(athlete_id),
+            "RowKey": activity_id,
+            "activity_name": activity.get("name", ""),
+            "athlete_firstname": athlete.get("firstname", ""),
+            "athlete_lastname": athlete.get("lastname", ""),
+            "distance": activity.get("distance"),
+            "moving_time": activity.get("moving_time"),
+            "elapsed_time": activity.get("elapsed_time"),
+            "total_elevation_gain": activity.get("total_elevation_gain"),
             "sport_type": activity.get("sport_type"),
             "workout_type": activity.get("workout_type"),
-            # Timestamps from Strava payload (strings)
-            "start_date": activity.get("start_date"),
-            "start_date_local": activity.get("start_date_local"),
-            "strava_updated_at": activity.get("updated_at"),
-            "club_activity_id": activity.get("id"),  # if Strava includes one
-            "club_id": _env_str("STRAVA_CLUB_ID"),
-            # Flattened athlete
-            "athlete_id": athlete_id if athlete_id is not None else None,
-            "athlete_firstname": firstname or None,
-            "athlete_lastname": lastname or None,
-            "athlete_json": None,
-            # Bookkeeping
-            "source": "club",
-            "updated_at": datetime.now(timezone.utc),
+            "last_updated": datetime.now(timezone.utc)
         }
-
-        # Load existing entity to preserve Discord fields for dedupe/edit logic
-        try:
-            existing = table.get_entity(partition_key=partition_key, row_key=row_key)
-        except AzureError:
-            existing = None
-        except Exception:
-            existing = None
-
-        if isinstance(existing, dict):
-            for k in (
-                "discord_message_id",
-                "discord_content",
-                "discord_posted_at",
-                "discord_updated_at",
-                "created_at",
-            ):
-                if existing.get(k) is not None and entity.get(k) is None:
-                    entity[k] = existing.get(k)
-
-        # Include athlete JSON if present
-        if athlete:
-            try:
-                import json as _json  # local import to avoid top-level dependency at cold start cost
-
-                entity["athlete_json"] = _json.dumps(athlete, ensure_ascii=False)
-            except (TypeError, ValueError):
-                # best-effort only
-                pass
-
-        # Copy any additional simple scalar fields from the payload
-        for k, v in activity.items():
-            if k in entity or k == "athlete":
-                continue
-            if isinstance(v, (str, int, float, bool)) and len(k) < 255:
-                # Avoid overwriting our bookkeeping names
-                safe_key = k if k not in {"PartitionKey", "RowKey"} else f"strava_{k}"
-                entity.setdefault(safe_key, v)
-
-        # Initialize created_at if missing
-        if entity.get("created_at") is None:
-            entity["created_at"] = datetime.now(timezone.utc)
-
-        # Remove keys with value None (Table Storage doesn't accept None)
-        entity = {k: v for k, v in entity.items() if v is not None}
-
-        # First upsert core activity data
-        table.upsert_entity(entity=entity, mode="merge")
-
-        # Post or update to Discord if configured
-        try:
-            _post_or_edit_discord(table, entity)
-        except (requests.RequestException, ValueError, OSError):
-            logging.exception("Discord post/edit failed")
-
-        logging.debug(
-            "Upserted club activity by %s %s: %s (PK=%s RK=%s)",
-            firstname,
-            lastname,
-            entity.get("name"),
-            partition_key,
-            row_key,
-        )
-    except (AzureError, ValueError, TypeError, OSError):
-        logging.exception("Failed processing club activity")
-
-
-def _to_utc_iso(dt: datetime) -> str:
-    try:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# Compaction removed: storage is minimal; we simply delete old entities in cleanup.
-
-
-@app.timer_trigger(schedule="0 0 4 * * *", arg_name="cleanupTimer")
-def cleanup_old_entities(cleanupTimer: func.TimerRequest) -> None:
-    """Daily cleanup: delete activities older than retention.
-
-    Env:
-    - STRAVA_DELETE_AFTER_DAYS: delete entities older than this (default 180)
-    - STRAVA_CLEANUP_MAX: max entities to process per run (default 500)
-    """
-    try:
-        table = _get_activities_table_client()
-        if table is None:
-            return
-
-        delete_days = _env_int("STRAVA_DELETE_AFTER_DAYS", 180)
-        max_ops = _env_int("STRAVA_CLEANUP_MAX", 500)
-        if delete_days <= 0:
-            return
-
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=delete_days)
-        cutoff_iso = _to_utc_iso(cutoff)
-
-        processed = 0
-        # Prefer created_at; fallback to updated_at if created_at missing
-        filter_created = f"created_at lt datetime'{cutoff_iso}'"
-        filter_updated = f"updated_at lt datetime'{cutoff_iso}' and (created_at eq null)"
-
-        try:
-            # Delete by created_at first
-            for page in table.list_entities(results_per_page=1000, query_filter=filter_created).by_page():
-                for e in page:
-                    try:
-                        pk = e.get("PartitionKey")
-                        rk = e.get("RowKey")
-                        if not pk or not rk:
-                            continue
-                        table.delete_entity(partition_key=pk, row_key=rk)
-                        processed += 1
-                        if processed >= max_ops:
-                            raise StopIteration
-                    except StopIteration:
-                        raise
-                    except AzureError:
-                        logging.exception(
-                            "Cleanup: failed to delete entity PK=%s RK=%s (created_at)",
-                            e.get("PartitionKey"),
-                            e.get("RowKey"),
-                        )
-                    except Exception:
-                        logging.exception("Cleanup: unexpected error during deletion (created_at)")
-        except StopIteration:
-            pass
-        except AzureError:
-            logging.exception("Cleanup: query for deletion by created_at failed")
-
-        # If capacity remains, delete by updated_at for legacy rows without created_at
-        if processed < max_ops:
-            remaining = max_ops - processed
-            try:
-                for page in table.list_entities(results_per_page=1000, query_filter=filter_updated).by_page():
-                    for e in page:
-                        try:
-                            pk = e.get("PartitionKey")
-                            rk = e.get("RowKey")
-                            if not pk or not rk:
-                                continue
-                            table.delete_entity(partition_key=pk, row_key=rk)
-                            processed += 1
-                            if processed >= max_ops or processed >= remaining:
-                                raise StopIteration
-                        except StopIteration:
-                            raise
-                        except AzureError:
-                            logging.exception(
-                                "Cleanup: failed to delete entity PK=%s RK=%s (updated_at)",
-                                e.get("PartitionKey"),
-                                e.get("RowKey"),
-                            )
-                        except Exception:
-                            logging.exception("Cleanup: unexpected error during deletion (updated_at)")
-            except StopIteration:
-                pass
-            except AzureError:
-                logging.exception("Cleanup: query for deletion by updated_at failed")
-
-        logging.info("Cleanup completed: deleted=%s", processed)
-    except Exception:
-        logging.exception("Cleanup: fatal error")
-
-
-def _get_activities_table_client() -> Optional[TableClient]:
-    """Create or return a TableClient for the StravaActivities table using Managed Identity.
-
-    Expects:
-    - AzureWebJobsStorage__tableServiceUri
-    - Optional: AzureWebJobsStorage__clientId (for user-assigned managed identity)
-    - Optional: STRAVA_ACTIVITIES_TABLE (defaults to 'StravaActivities')
-    """
-    try:
-        table_service_uri = _env_str("AzureWebJobsStorage__tableServiceUri")
-        conn_str = _env_str("AzureWebJobsStorage")
-        if not table_service_uri and not conn_str:
-            logging.error(
-                (
-                    "Table config missing: set AzureWebJobsStorage__tableServiceUri (managed identity) or "
-                    "AzureWebJobsStorage (connection string)"
-                )
-            )
-            return None
-
-        client_id = (
-            _env_str("AzureWebJobsStorage__clientId")
-            or _env_str("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
-            or _env_str("AZURE_CLIENT_ID")
-        )
-        table_name = _env_str("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
-        service: Optional[TableServiceClient] = None
-        if table_service_uri:
-            credential = ManagedIdentityCredential(client_id=client_id) if client_id else ManagedIdentityCredential()
-            service = TableServiceClient(endpoint=table_service_uri, credential=credential)
-        elif conn_str:
-            # Local fallback (supports Azurite with UseDevelopmentStorage=true)
-            service = TableServiceClient.from_connection_string(conn_str)
-
-        if service is None:
-            logging.error("Failed to initialize TableServiceClient")
-            return None
-
-        # Ensure table exists
-        try:
-            service.create_table_if_not_exists(table_name=table_name)
-        except AzureError:
-            # table may already exist or lack permission to create
-            pass
-
-        return service.get_table_client(table_name=table_name)
-    except AzureError:
-        logging.exception("Failed to create TableClient for activities (Azure error)")
-        return None
-
-
-def _get_bearer_token() -> Optional[str]:
-    """Return a Strava bearer token.
-
-    Preference order:
-    1) STRAVA_ACCESS_TOKEN (direct)
-    2) Refresh-token flow using STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
-    """
-    direct = _env_str("STRAVA_ACCESS_TOKEN")
-    if direct:
-        return direct
-
-    client_id = _env_str("STRAVA_CLIENT_ID")
-    client_secret = _env_str("STRAVA_CLIENT_SECRET")
-    refresh_token = _env_str("STRAVA_REFRESH_TOKEN")
-    if not (client_id and client_secret and refresh_token):
-        return None
-
-    # Use cache if still valid for at least 60 seconds
-    now = int(datetime.now(timezone.utc).timestamp())
-    try:
-        cached_token = _TOKEN_CACHE.get("access_token")
-        exp_val: Any = _TOKEN_CACHE.get("expires_at")
-        if isinstance(exp_val, (int, float, str)):
-            try:
-                cached_exp = int(exp_val)
-            except (TypeError, ValueError):
-                cached_exp = 0
+        
+        # Determine if we need to post or update
+        should_post = existing_entity is None
+        should_update = (existing_entity is not None and
+                        existing_entity.get("activity_name") != entity["activity_name"])
+        
+        if should_post:
+            # Post new message to Discord
+            message_id = post_to_discord(entity)
+            if message_id:
+                entity["discord_message_id"] = message_id
+                table_client.upsert_entity(entity)
+                logging.info(f"Posted new activity: {entity['activity_name']}")
+        
+        elif should_update:
+            # Update existing Discord message
+            message_id = existing_entity.get("discord_message_id")
+            if message_id and update_discord_message(entity, message_id):
+                entity["discord_message_id"] = message_id
+                table_client.upsert_entity(entity)
+                logging.info(f"Updated activity: {entity['activity_name']}")
+        
         else:
-            cached_exp = 0
-        cached_rt = _TOKEN_CACHE.get("refresh_token")
-    except (KeyError, TypeError):
-        cached_token = None
-        cached_exp = 0
-        cached_rt = None
-
-    if cached_token and cached_exp - now > 60 and cached_rt == refresh_token:
-        return str(cached_token)
-
-    # Refresh via Strava OAuth endpoint
-    try:
-        resp = _request_with_retries(
-            method="POST",
-            url="https://www.strava.com/api/v3/oauth/token",
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
-            timeout=15,
-            retry_label="strava:token_refresh",
-        )
-        if resp is None or resp.status_code != 200:
-            status = getattr(resp, "status_code", "<no resp>")
-            text = getattr(resp, "text", "")
-            logging.warning("Strava token refresh failed: %s %s", status, text[:200])
-            return None
-        body = resp.json() or {}
-        access_token = body.get("access_token")
-        expires_at = int(body.get("expires_at") or 0)
-        new_refresh = body.get("refresh_token") or refresh_token
-        if not access_token:
-            return None
-        _TOKEN_CACHE["access_token"] = access_token
-        _TOKEN_CACHE["expires_at"] = expires_at
-        _TOKEN_CACHE["refresh_token"] = new_refresh
-        return access_token
-    except requests.RequestException:
-        logging.exception("Failed to refresh Strava access token")
-        return None
+            logging.debug(f"No changes for activity: {entity['activity_name']}")
+            
+    except Exception as e:
+        logging.error(f"Error processing activity: {e}")
 
 
-def _meters_to_miles(meters: Any) -> Optional[float]:
-    try:
-        if meters is None:
-            return None
-        m = float(meters)
-        return m / 1609.344
-    except (TypeError, ValueError):
-        return None
-
-
-def _seconds_to_minutes(seconds: Any) -> Optional[int]:
-    try:
-        if seconds is None:
-            return None
-        s = float(seconds)
-        return int(round(s / 60.0))
-    except (TypeError, ValueError):
-        return None
-
-
-def _build_discord_content(
-    entity: Dict[str, Any], include_separator: bool = False, run_post_count: int = 0
-) -> str:
-    firstname = entity.get("athlete_firstname") or ""
-    lastname = entity.get("athlete_lastname") or ""
-    athlete_name = (f"{firstname} {lastname}").strip() or "Someone"
-
-    name = entity.get("name") or entity.get("sport_type") or entity.get("type") or "Workout"
-    sport = (entity.get("sport_type") or entity.get("type") or "").strip()
-
-    distance_m = entity.get("distance")
-    miles = _meters_to_miles(distance_m)
-    moving_secs_val = entity.get("moving_time")
-    mins = _seconds_to_minutes(moving_secs_val)
-
-    def workout_type_label(sport_name: str, wt: Any) -> Optional[str]:
-        # Normalize
-        try:
-            code = int(wt) if wt is not None and str(wt).strip() != "" else None
-        except (TypeError, ValueError):
-            code = None
-        if code is None:
-            return None
-        s = sport_name or ""
-        is_run = s in ("Run", "TrailRun")
-        is_ride = "Ride" in s and s not in ("Run", "TrailRun")
-        if is_run:
-            return {1: "Race", 2: "Long Run", 3: "Workout"}.get(code)
-        if is_ride:
-            return {10: "Race", 11: "Workout"}.get(code)
-        return None
-
-    def sport_emoji(s: str) -> str:
-        m = {
-            "Run": "🏃",
-            "Ride": "🚴",
-            "Walk": "🚶",
-            "Hike": "🥾",
-            "Swim": "🏊",
-            "Workout": "🏋️",
-            "WeightTraining": "🏋️",
-            "Yoga": "🧘",
-            "Rowing": "🚣",
-        }
-        return m.get(s, "🏅") if s else "🏅"
-
-    lines: list[str] = []
-    lines.append(f"🔥 {athlete_name}")
-    lines.append(f"{sport_emoji(sport)} {name}")
-
-    # Include distance: swims stay in meters; others in miles
-    is_swim = "Swim" in sport
-    is_ride = "Ride" in sport
-    if is_swim:
-        try:
-            if distance_m is not None and float(distance_m) > 0:
-                lines.append(f"📏 {int(round(float(distance_m)))} m")
-        except (TypeError, ValueError):
-            pass
-    else:
-        if miles is not None and miles >= 0.05:
-            lines.append(f"📏 {miles:.2f} mi")
-
-    # Include moving time when available
-    if mins is not None and mins > 0:
-        lines.append(f"⏱️ {mins} min")
-
-    # Add pace for relevant sports when distance/time are meaningful
-    def _is_pace_sport(s: str) -> bool:
-        s = s or ""
-        return any(x in s for x in ["Run", "Walk", "Hike"])  # Run/TrailRun/Walk/Hike
-
-    try:
-        if isinstance(moving_secs_val, (int, float)) and moving_secs_val > 0:
-            if is_swim and distance_m is not None and float(distance_m) > 0:
-                # Pace per 100m
-                distance_val = float(distance_m)
-                if distance_val > 0:  # Additional safety check
-                    secs_per_100m = float(moving_secs_val) / (distance_val / 100.0)
-                    pace_min = int(secs_per_100m // 60)
-                    pace_sec = int(round(secs_per_100m % 60))
-                    if pace_sec == 60:
-                        pace_min += 1
-                        pace_sec = 0
-                    lines.append(f"🏁 {pace_min}:{pace_sec:02d} /100m")
-            elif miles is not None and miles >= 0.1 and _is_pace_sport(sport):
-                # Pace for run/walk/hike
-                secs_per_mile = float(moving_secs_val) / float(miles)
-                pace_min = int(secs_per_mile // 60)
-                pace_sec = int(round(secs_per_mile % 60))
-                if pace_sec == 60:
-                    pace_min += 1
-                    pace_sec = 0
-                lines.append(f"🏁 {pace_min}:{pace_sec:02d} /mi")
-            elif is_ride:
-                # Speed for rides (mph)
-                mph = None
-                if miles is not None and miles > 0.05:
-                    hours = float(moving_secs_val) / 3600.0
-                    if hours > 0:
-                        mph = float(miles) / hours
-                if mph is None:
-                    avg_mps = entity.get("average_speed")
-                    try:
-                        if avg_mps is not None:
-                            mph = float(avg_mps) * 2.2369362920544
-                    except (TypeError, ValueError):
-                        mph = None
-                if mph is not None and mph > 0.5:
-                    lines.append(f"⚡ {mph:.1f} mph")
-    except (TypeError, ValueError):
-        pass
-
-    # Always include sport label, and append workout type mapping when available
-    if sport:
-        wt_label = workout_type_label(sport, entity.get("workout_type"))
-        if wt_label:
-            lines.append(f"🏅 {sport} - {wt_label}")
-        else:
-            lines.append(f"🏅 {sport}")
-
-    # Optional separator for multi-activity runs
-    if include_separator:
-        try:
-            # Append a separator starting from the second post
-            if run_post_count >= 1:
-                lines.append("────────")
-        except NameError:
-            # Counter not initialized; ignore
-            pass
-
-    content = "\n".join(lines)
-    # Discord limit is 2000 chars; keep buffer for safety
-    return content[:1800]
-
-
-def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
-    global _RUN_POST_COUNT  # Declare global at the top of the function
+def format_discord_message(entity: Dict[str, Any]) -> str:
+    """Format activity data for Discord message."""
+    firstname = entity.get("athlete_firstname", "")
+    lastname = entity.get("athlete_lastname", "")
+    athlete_name = f"{firstname} {lastname}".strip() or "Unknown Athlete"
     
-    webhook_url = _env_str("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        return
+    activity_name = entity.get("activity_name", "Activity")
+    sport_type = entity.get("sport_type", "")
+    distance = entity.get("distance")
+    moving_time = entity.get("moving_time")
+    
+    # Start building message
+    lines = [f"🏃 {athlete_name}", f"📝 {activity_name}"]
+    
+    # Add sport type emoji
+    sport_emoji = get_sport_emoji(sport_type)
+    if sport_emoji:
+        lines.append(f"{sport_emoji} {sport_type}")
+    
+    # Add distance (skip for certain activity types)
+    if should_include_distance(sport_type) and distance:
+        distance_text = format_distance(distance, sport_type)
+        if distance_text:
+            lines.append(distance_text)
+    
+    # Add pace/speed if we have distance and time
+    if distance and moving_time and should_include_distance(sport_type):
+        pace_text = format_pace(distance, moving_time, sport_type)
+        if pace_text:
+            lines.append(pace_text)
+    
+    # Add moving time
+    if moving_time:
+        lines.append(f"⏱️ {format_time(moving_time)}")
+    
+    return "\n".join(lines)
 
-    edit_updates = _env_bool("DISCORD_EDIT_UPDATES", True)
 
-    # Build a base content used for storage and comparisons (no per-run separator)
-    base_content = _build_discord_content(entity, include_separator=False, run_post_count=_RUN_POST_COUNT)
-    if not base_content:
-        return
+def get_sport_emoji(sport_type: str) -> str:
+    """Get emoji for sport type."""
+    emoji_map = {
+        "Run": "🏃",
+        "TrailRun": "🥾", 
+        "Ride": "🚴",
+        "Swim": "🏊",
+        "Walk": "🚶",
+        "Hike": "🥾",
+        "Workout": "💪",
+        "WeightTraining": "🏋️",
+        "Yoga": "🧘",
+        "Rowing": "🚣"
+    }
+    return emoji_map.get(sport_type, "🏅")
 
-    existing_content = entity.get("discord_content")
-    message_id = entity.get("discord_message_id")
 
-    # If a message already exists and edits are disabled, skip to prevent duplicates
-    if message_id and not edit_updates:
-        return
+def should_include_distance(sport_type: str) -> bool:
+    """Check if distance should be included for this sport type."""
+    no_distance_sports = {"Workout", "WeightTraining", "Yoga", "Meditation"}
+    return sport_type not in no_distance_sports
 
-    if edit_updates and message_id and existing_content is not None:
-        # Edit existing message if content changed
-        if base_content == existing_content:
-            return
-        # Log a concise diff to diagnose why we edit
-        try:
-            old_lines = str(existing_content).splitlines()
-            new_lines = str(base_content).splitlines()
-            first_diff_idx = None
-            for i in range(min(len(old_lines), len(new_lines))):
-                if old_lines[i] != new_lines[i]:
-                    first_diff_idx = i
-                    break
-            if first_diff_idx is None and len(old_lines) != len(new_lines):
-                first_diff_idx = min(len(old_lines), len(new_lines))
-            if first_diff_idx is not None:
-                logging.info(
-                    "Discord edit: first diff at line %s | old='%s' | new='%s'",
-                    first_diff_idx,
-                    (old_lines[first_diff_idx] if first_diff_idx < len(old_lines) else "<no line>")[:160],
-                    (new_lines[first_diff_idx] if first_diff_idx < len(new_lines) else "<no line>")[:160],
-                )
-            else:
-                logging.info("Discord edit: content changed (no line diff found, possibly whitespace)")
-        except Exception:
-            pass
-        base = webhook_url.split("?")[0].rstrip("/")
-        edit_url = f"{base}/messages/{message_id}"
-        resp = _request_with_retries(
-            method="PATCH",
-            url=edit_url,
-            json={"content": base_content},
-            timeout=15,
-            retry_label="discord:edit",
-        )
-        if resp is not None and resp.status_code in (200, 204):
-            entity["discord_content"] = base_content
-            entity["discord_updated_at"] = datetime.now(timezone.utc)
-            table.upsert_entity(entity=entity, mode="merge")
-        else:
-            status = getattr(resp, "status_code", "<no resp>")
-            text = getattr(resp, "text", "")
-            logging.warning("Discord edit failed: %s %s", status, text[:200])
-        return
 
-    # Post new message and capture message id with wait=true
-    wait_url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
-    # For new posts we may include a separator visually, but we keep base_content in storage
-    posted_content = _build_discord_content(entity, include_separator=True, run_post_count=_RUN_POST_COUNT)
-    resp = _request_with_retries(
-        method="POST",
-        url=wait_url,
-        json={"content": posted_content},
-        timeout=15,
-        retry_label="discord:post",
-    )
-    if resp is not None and resp.status_code in (200, 204):
-        try:
-            body = resp.json() if resp.status_code == 200 else {}
-        except ValueError:
-            body = {}
-        msg_id = body.get("id")
-        entity["discord_message_id"] = msg_id
-        entity["discord_content"] = base_content
-        entity["discord_posted_at"] = datetime.now(timezone.utc)
-        table.upsert_entity(entity=entity, mode="merge")
-        # Increment per-run post counter on successful new post
-        try:
-            _RUN_POST_COUNT += 1
-        except Exception:
-            pass
+def format_distance(distance_meters: float, sport_type: str) -> str:
+    """Format distance with appropriate units."""
+    if sport_type == "Swim":
+        # Convert meters to yards
+        yards = distance_meters * 1.094
+        return f"📏 {yards:.0f} yds"
     else:
-        status = getattr(resp, "status_code", "<no resp>")
-        text = getattr(resp, "text", "")
-        logging.warning("Discord post failed: %s %s", status, text[:200])
+        # Convert meters to miles
+        miles = distance_meters * 0.000621371
+        return f"📏 {miles:.2f} mi"
 
 
-class _WaitRetryAfterOrExponential(wait_base):
-    def __init__(self, base: float, cap: float) -> None:
-        self.base = base
-        self.cap = cap
+def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: str) -> str:
+    """Format pace based on sport type."""
+    if sport_type == "Swim":
+        # Time per 100 yards
+        yards = distance_meters * 1.094
+        if yards > 0:
+            seconds_per_100_yards = (moving_time_seconds / yards) * 100
+            minutes = int(seconds_per_100_yards // 60)
+            seconds = int(seconds_per_100_yards % 60)
+            return f"⚡ {minutes}:{seconds:02d}/100yd"
+    
+    elif sport_type in ["Run", "TrailRun", "Walk", "Hike"]:
+        # Minutes per mile
+        miles = distance_meters * 0.000621371
+        if miles > 0:
+            minutes_per_mile = moving_time_seconds / 60 / miles
+            minutes = int(minutes_per_mile)
+            seconds = int((minutes_per_mile - minutes) * 60)
+            return f"⚡ {minutes}:{seconds:02d}/mi"
+    
+    elif sport_type == "Ride":
+        # Show speed in mph
+        miles = distance_meters * 0.000621371
+        hours = moving_time_seconds / 3600
+        if hours > 0:
+            mph = miles / hours
+            return f"⚡ {mph:.1f} mph"
+    
+    return ""
 
-    def __call__(self, retry_state) -> float:
-        # Default exponential backoff with small jitter
-        backoff = min(self.cap, self.base * (2 ** (max(1, retry_state.attempt_number) - 1)))
-        jitter = random.uniform(0, 0.25)
-        wait_s = backoff + jitter
 
-        # If last result was a Response with 429 + Retry-After header, honor it
-        outcome = getattr(retry_state, "outcome", None)
-        try:
-            result = outcome.result() if outcome is not None else None
-        except Exception:
-            result = None
-        if result is not None and hasattr(result, "status_code") and getattr(result, "status_code", 0) == 429:
-            try:
-                ra = float(result.headers.get("Retry-After")) if hasattr(result, "headers") else None
-            except (TypeError, ValueError):
-                ra = None
-            if ra is not None and ra > 0:
-                return min(self.cap, ra) + jitter
-        return wait_s
+def format_time(seconds: int) -> str:
+    """Format time duration."""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
 
 
-def _request_with_retries(
-    method: str,
-    url: str,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    json: Optional[Dict[str, Any]] = None,
-    data: Optional[Dict[str, Any]] = None,
-    timeout: int = 15,
-    retry_label: str = "http",
-):
-    """HTTP call with Tenacity retries (returns requests.Response or None).
-
-    Retries on 429 and transient 5xx (500/502/503/504) and network errors.
-    Honors Retry-After on 429.
-    Env controls:
-    - HTTP_MAX_RETRIES (default 3)
-    """
-    max_retries = _env_int("HTTP_MAX_RETRIES", 3)
-    base = 1.0
-    cap = 8.0
-    transient = {429, 500, 502, 503, 504}
-
-    def do_request():
-        try:
-            return _HTTP.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                json=json,
-                data=data,
-                timeout=timeout,
-            )
-        except requests.RequestException:
-            # Let retry_if_exception_type handle it
-            raise
-
-    def _last_status_code(rs) -> str:
-        try:
-            outcome = getattr(rs, "outcome", None)
-            res = outcome.result() if outcome is not None else None
-            return str(getattr(res, "status_code", "n/a"))
-        except Exception:
-            return "n/a"
-
-    retryer = Retrying(
-        reraise=False,
-        stop=stop_after_attempt(max_retries + 1),
-        wait=_WaitRetryAfterOrExponential(base, cap),
-        retry=(
-            retry_if_exception_type(requests.RequestException)
-            | retry_if_result(lambda r: getattr(r, "status_code", 0) in transient)
-        ),
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(requests.RequestException)
+)
+def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
+    """Post new message to Discord and return message ID."""
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        logging.error("DISCORD_WEBHOOK_URL not set")
+        return None
+    
+    message_content = format_discord_message(entity)
+    
+    response = requests.post(
+        webhook_url,
+        json={"content": message_content},
+        params={"wait": "true"},
+        timeout=30
     )
-
-    # Tenacity doesn't include retry_if_result by default in this construction, so we emulate
-    # by checking response status code in a loop of attempts
-    for attempt in retryer:
-        with attempt:
-            resp = do_request()
-            # Return response; retry_if_result will decide whether to retry on transient codes
-            return resp
-
-    # If we get here, retries exhausted
-    return None
+    response.raise_for_status()
+    
+    return response.json().get("id")
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(requests.RequestException)
+)
+def update_discord_message(entity: Dict[str, Any], message_id: str) -> bool:
+    """Update existing Discord message."""
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        logging.error("DISCORD_WEBHOOK_URL not set")
+        return False
+    
+    # Remove query params and add message ID
+    base_url = webhook_url.split("?")[0]
+    edit_url = f"{base_url}/messages/{message_id}"
+    
+    message_content = format_discord_message(entity)
+    
+    response = requests.patch(
+        edit_url,
+        json={"content": message_content},
+        timeout=30
+    )
+    response.raise_for_status()
+    
+    return True
