@@ -568,12 +568,19 @@ def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: st
             return f"⚡ Pace: {minutes}:{seconds:02d}/mi"
 
     elif sport_type == "Ride":
-        # Show speed in mph
+        # Show both pace and average speed for cycling
         miles = distance_meters * 0.000621371
-        hours = moving_time_seconds / 3600
-        if hours > 0:
+        if miles > 0:
+            # Calculate pace (minutes per mile)
+            minutes_per_mile = moving_time_seconds / 60 / miles
+            pace_minutes = int(minutes_per_mile)
+            pace_seconds = int((minutes_per_mile - pace_minutes) * 60)
+            
+            # Calculate average speed (mph)
+            hours = moving_time_seconds / 3600
             mph = miles / hours
-            return f"⚡ Speed: {mph:.1f} mph"
+            
+            return f"⚡ Pace: {pace_minutes}:{pace_seconds:02d}/mi - Avg speed: {mph:.1f} mph"
 
     return ""
 
