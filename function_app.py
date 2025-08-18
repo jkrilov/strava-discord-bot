@@ -469,7 +469,7 @@ def process_activity(
         return "error"
 
 
-def format_discord_message(entity: Dict[str, Any], include_separator: bool = True) -> str:
+def format_discord_message(entity: Dict[str, Any], include_separator: bool = False) -> str:
     """Format activity data for Discord message."""
     firstname = entity.get("athlete_firstname", "")
     lastname = entity.get("athlete_lastname", "")
