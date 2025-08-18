@@ -1,6 +1,7 @@
 import os
 import logging
 import hashlib
+import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
@@ -15,6 +16,52 @@ app = func.FunctionApp()
 
 # Strava OAuth token cache
 _token_cache = {"access_token": None, "expires_at": 0}
+
+
+def discord_retry_with_backoff(func):
+    """Custom retry decorator for Discord rate limits."""
+    def wrapper(*args, **kwargs):
+        max_retries = 5
+        base_delay = 2  # Discord webhook rate limit is typically 5 requests per 2 seconds
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except requests.HTTPError as e:
+                if e.response.status_code == 429:  # Rate limited
+                    # Check for Retry-After header
+                    retry_after = e.response.headers.get('Retry-After')
+                    if retry_after:
+                        delay = int(retry_after)
+                    else:
+                        # Exponential backoff: 2, 4, 8, 16, 32 seconds
+                        delay = base_delay * (2 ** attempt)
+                    
+                    logging.warning(f"Discord rate limited, retrying in {delay} seconds", extra={
+                        "operation": func.__name__,
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "delay_seconds": delay,
+                        "retry_after_header": retry_after
+                    })
+                    
+                    if attempt < max_retries - 1:  # Don't sleep on last attempt
+                        time.sleep(delay)
+                    else:
+                        logging.error("Max retries exceeded for Discord API", extra={
+                            "operation": func.__name__,
+                            "max_retries": max_retries
+                        })
+                        raise
+                else:
+                    # For non-rate-limit errors, fail immediately
+                    raise
+            except Exception:
+                # For non-HTTP errors, fail immediately
+                raise
+        
+        return None
+    return wrapper
 
 
 @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
@@ -64,13 +111,19 @@ def poll_strava_activities(myTimer: func.TimerRequest) -> None:
             return
 
         # Process each activity
-        for activity in activities:
+        for i, activity in enumerate(activities):
             result = process_activity(activity, table_client)
             activities_processed += 1
             if result == "posted":
                 activities_posted += 1
+                # Add small delay after posting to respect Discord rate limits
+                if i < len(activities) - 1:  # Don't delay after last activity
+                    time.sleep(0.5)
             elif result == "updated":
                 activities_updated += 1
+                # Add small delay after updating to respect Discord rate limits
+                if i < len(activities) - 1:  # Don't delay after last activity
+                    time.sleep(0.5)
 
         end_time = datetime.now(timezone.utc)
         duration = (end_time - start_time).total_seconds()
@@ -194,7 +247,7 @@ def fetch_club_activities(access_token: str) -> list:
         response = requests.get(
             f"https://www.strava.com/api/v3/clubs/{club_id}/activities",
             headers=headers,
-            params={"page": 1, "per_page": 30},
+            params={"page": 1, "per_page": 20},
             timeout=30
         )
         response.raise_for_status()
@@ -291,14 +344,16 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
     try:
         activity_id = create_activity_id(activity)
         athlete = activity.get("athlete", {})
-        athlete_id = athlete.get("id", "unknown")
         athlete_name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+        
+        # Use athlete name as partition key (athlete ID not available in club activities API)
+        partition_key = athlete_name or "unknown_athlete"
 
         logging.debug("Processing activity", extra={
             "operation": "process_activity",
             "activity_id": activity_id,
-            "athlete_id": athlete_id,
             "athlete_name": athlete_name,
+            "partition_key": partition_key,
             "activity_name": activity.get("name", ""),
             "sport_type": activity.get("sport_type")
         })
@@ -306,7 +361,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
         # Check if activity exists in table
         try:
             existing_entity = table_client.get_entity(
-                partition_key=str(athlete_id),
+                partition_key=partition_key,
                 row_key=activity_id
             )
         except AzureError:
@@ -314,7 +369,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
 
         # Create/update entity
         entity = {
-            "PartitionKey": str(athlete_id),
+            "PartitionKey": partition_key,
             "RowKey": activity_id,
             "activity_name": activity.get("name", ""),
             "athlete_firstname": athlete.get("firstname", ""),
@@ -438,7 +493,10 @@ def format_discord_message(entity: Dict[str, Any]) -> str:
 
     # Add moving time
     if moving_time:
-        lines.append(f"⏱️ {format_time(moving_time)}")
+        lines.append(f"⏱️ Total time: {format_time(moving_time)}")
+
+    # Add separator line to help Discord display messages separately
+    lines.append("----------")
 
     return "\n".join(lines)
 
@@ -471,11 +529,11 @@ def format_distance(distance_meters: float, sport_type: str) -> str:
     if sport_type == "Swim":
         # Convert meters to yards
         yards = distance_meters * 1.094
-        return f"📏 {yards:.0f} yds"
+        return f"📏 Distance: {yards:.0f} yds"
     else:
         # Convert meters to miles
         miles = distance_meters * 0.000621371
-        return f"📏 {miles:.2f} mi"
+        return f"📏 Distance: {miles:.2f} mi"
 
 
 def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: str) -> str:
@@ -487,7 +545,7 @@ def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: st
             seconds_per_100_yards = (moving_time_seconds / yards) * 100
             minutes = int(seconds_per_100_yards // 60)
             seconds = int(seconds_per_100_yards % 60)
-            return f"⚡ {minutes}:{seconds:02d}/100yd"
+            return f"⚡ Pace: {minutes}:{seconds:02d}/100yd"
 
     elif sport_type in ["Run", "TrailRun", "Walk", "Hike"]:
         # Minutes per mile
@@ -496,7 +554,7 @@ def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: st
             minutes_per_mile = moving_time_seconds / 60 / miles
             minutes = int(minutes_per_mile)
             seconds = int((minutes_per_mile - minutes) * 60)
-            return f"⚡ {minutes}:{seconds:02d}/mi"
+            return f"⚡ Pace: {minutes}:{seconds:02d}/mi"
 
     elif sport_type == "Ride":
         # Show speed in mph
@@ -504,7 +562,7 @@ def format_pace(distance_meters: float, moving_time_seconds: int, sport_type: st
         hours = moving_time_seconds / 3600
         if hours > 0:
             mph = miles / hours
-            return f"⚡ {mph:.1f} mph"
+            return f"⚡ Speed: {mph:.1f} mph"
 
     return ""
 
@@ -520,11 +578,7 @@ def format_time(seconds: int) -> str:
         return f"{minutes}m"
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(requests.RequestException)
-)
+@discord_retry_with_backoff
 def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
     """Post new message to Discord and return message ID."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
@@ -579,11 +633,7 @@ def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
         raise
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(requests.RequestException)
-)
+@discord_retry_with_backoff
 def update_discord_message(entity: Dict[str, Any], message_id: str) -> bool:
     """Update existing Discord message."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
