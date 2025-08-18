@@ -112,7 +112,11 @@ def poll_strava_activities(myTimer: func.TimerRequest) -> None:
 
         # Process each activity
         for i, activity in enumerate(activities):
-            result = process_activity(activity, table_client)
+            is_batch = len(activities) > 1
+            is_last = (i == len(activities) - 1)
+            result = process_activity(
+                activity, table_client, is_batch, is_last
+            )
             activities_processed += 1
             if result == "posted":
                 activities_posted += 1
@@ -339,7 +343,12 @@ def create_activity_id(activity: Dict[str, Any]) -> str:
     return hashlib.md5(data.encode()).hexdigest()
 
 
-def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str:
+def process_activity(
+    activity: Dict[str, Any],
+    table_client: TableClient,
+    is_batch_processing: bool = False,
+    is_last_in_batch: bool = True
+) -> str:
     """Process a single activity - check if new/changed and post/update Discord."""
     try:
         activity_id = create_activity_id(activity)
@@ -390,7 +399,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
 
         if should_post:
             # Post new message to Discord
-            message_id = post_to_discord(entity)
+            message_id = post_to_discord(entity, is_batch_processing, is_last_in_batch)
             if message_id:
                 entity["discord_message_id"] = message_id
                 table_client.upsert_entity(entity)
@@ -416,7 +425,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
         elif should_update:
             # Update existing Discord message
             message_id = existing_entity.get("discord_message_id")
-            if message_id and update_discord_message(entity, message_id):
+            if message_id and update_discord_message(entity, message_id, is_batch_processing, is_last_in_batch):
                 entity["discord_message_id"] = message_id
                 table_client.upsert_entity(entity)
                 logging.info(f"Updated activity: {entity['activity_name']}", extra={
@@ -460,7 +469,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str
         return "error"
 
 
-def format_discord_message(entity: Dict[str, Any]) -> str:
+def format_discord_message(entity: Dict[str, Any], include_separator: bool = True) -> str:
     """Format activity data for Discord message."""
     firstname = entity.get("athlete_firstname", "")
     lastname = entity.get("athlete_lastname", "")
@@ -495,8 +504,10 @@ def format_discord_message(entity: Dict[str, Any]) -> str:
     if moving_time:
         lines.append(f"⏱️ Total time: {format_time(moving_time)}")
 
-    # Add separator line to help Discord display messages separately
-    lines.append("----------")
+    # Add separator line only when processing multiple activities and not the last one
+    # Discord naturally separates messages posted at different times (5+ minutes apart)
+    if include_separator:
+        lines.append("----------")
 
     return "\n".join(lines)
 
@@ -579,7 +590,11 @@ def format_time(seconds: int) -> str:
 
 
 @discord_retry_with_backoff
-def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
+def post_to_discord(
+    entity: Dict[str, Any],
+    is_batch_processing: bool = False,
+    is_last_in_batch: bool = True
+) -> Optional[str]:
     """Post new message to Discord and return message ID."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
@@ -590,7 +605,9 @@ def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
         return None
 
     try:
-        message_content = format_discord_message(entity)
+        # Include separator only when processing multiple activities and not the last one
+        include_separator = is_batch_processing and not is_last_in_batch
+        message_content = format_discord_message(entity, include_separator)
         athlete_name = f"{entity.get('athlete_firstname', '')} {entity.get('athlete_lastname', '')}".strip()
 
         logging.debug("Posting to Discord", extra={
@@ -634,7 +651,12 @@ def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
 
 
 @discord_retry_with_backoff
-def update_discord_message(entity: Dict[str, Any], message_id: str) -> bool:
+def update_discord_message(
+    entity: Dict[str, Any],
+    message_id: str,
+    is_batch_processing: bool = False,
+    is_last_in_batch: bool = True
+) -> bool:
     """Update existing Discord message."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
@@ -649,7 +671,9 @@ def update_discord_message(entity: Dict[str, Any], message_id: str) -> bool:
         base_url = webhook_url.split("?")[0]
         edit_url = f"{base_url}/messages/{message_id}"
 
-        message_content = format_discord_message(entity)
+        # Include separator only when processing multiple activities and not the last one
+        include_separator = is_batch_processing and not is_last_in_batch
+        message_content = format_discord_message(entity, include_separator)
         athlete_name = f"{entity.get('athlete_firstname', '')} {entity.get('athlete_lastname', '')}".strip()
 
         logging.debug("Updating Discord message", extra={
