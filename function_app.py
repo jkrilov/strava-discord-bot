@@ -237,7 +237,7 @@ def _process_club_activity(activity: dict) -> None:
             "start_date_local": activity.get("start_date_local"),
             "strava_updated_at": activity.get("updated_at"),
             "club_activity_id": activity.get("id"),  # if Strava includes one
-            "club_id": os.getenv("STRAVA_CLUB_ID"),
+            "club_id": _env_str("STRAVA_CLUB_ID"),
             # Flattened athlete
             "athlete_id": athlete_id if athlete_id is not None else None,
             "athlete_firstname": firstname or None,
@@ -339,8 +339,8 @@ def cleanup_old_entities(cleanupTimer: func.TimerRequest) -> None:
         if table is None:
             return
 
-        delete_days = int(os.getenv("STRAVA_DELETE_AFTER_DAYS", "180") or "180")
-        max_ops = int(os.getenv("STRAVA_CLEANUP_MAX", "500") or "500")
+        delete_days = _env_int("STRAVA_DELETE_AFTER_DAYS", 180)
+        max_ops = _env_int("STRAVA_CLEANUP_MAX", 500)
         if delete_days <= 0:
             return
 
@@ -474,13 +474,13 @@ def _get_bearer_token() -> Optional[str]:
     1) STRAVA_ACCESS_TOKEN (direct)
     2) Refresh-token flow using STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
     """
-    direct = os.getenv("STRAVA_ACCESS_TOKEN")
+    direct = _env_str("STRAVA_ACCESS_TOKEN")
     if direct:
         return direct
 
-    client_id = os.getenv("STRAVA_CLIENT_ID")
-    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
-    refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
+    client_id = _env_str("STRAVA_CLIENT_ID")
+    client_secret = _env_str("STRAVA_CLIENT_SECRET")
+    refresh_token = _env_str("STRAVA_REFRESH_TOKEN")
     if not (client_id and client_secret and refresh_token):
         return None
 
@@ -536,9 +536,6 @@ def _get_bearer_token() -> Optional[str]:
         return access_token
     except requests.RequestException:
         logging.exception("Failed to refresh Strava access token")
-        return None
-    except OSError:
-        logging.exception("Failed to create TableClient for activities (OS error)")
         return None
 
 
@@ -638,13 +635,15 @@ def _build_discord_content(
         if isinstance(moving_secs_val, (int, float)) and moving_secs_val > 0:
             if is_swim and distance_m is not None and float(distance_m) > 0:
                 # Pace per 100m
-                secs_per_100m = float(moving_secs_val) / (float(distance_m) / 100.0)
-                pace_min = int(secs_per_100m // 60)
-                pace_sec = int(round(secs_per_100m % 60))
-                if pace_sec == 60:
-                    pace_min += 1
-                    pace_sec = 0
-                lines.append(f"🏁 {pace_min}:{pace_sec:02d} /100m")
+                distance_val = float(distance_m)
+                if distance_val > 0:  # Additional safety check
+                    secs_per_100m = float(moving_secs_val) / (distance_val / 100.0)
+                    pace_min = int(secs_per_100m // 60)
+                    pace_sec = int(round(secs_per_100m % 60))
+                    if pace_sec == 60:
+                        pace_min += 1
+                        pace_sec = 0
+                    lines.append(f"🏁 {pace_min}:{pace_sec:02d} /100m")
             elif miles is not None and miles >= 0.1 and _is_pace_sport(sport):
                 # Pace for run/walk/hike
                 secs_per_mile = float(moving_secs_val) / float(miles)
@@ -697,11 +696,13 @@ def _build_discord_content(
 
 
 def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    global _RUN_POST_COUNT  # Declare global at the top of the function
+    
+    webhook_url = _env_str("DISCORD_WEBHOOK_URL")
     if not webhook_url:
         return
 
-    edit_updates = os.getenv("DISCORD_EDIT_UPDATES", "true").lower() == "true"
+    edit_updates = _env_bool("DISCORD_EDIT_UPDATES", True)
 
     # Build a base content used for storage and comparisons (no per-run separator)
     base_content = _build_discord_content(entity, include_separator=False, run_post_count=_RUN_POST_COUNT)
@@ -783,7 +784,6 @@ def _post_or_edit_discord(table: TableClient, entity: Dict[str, Any]) -> None:
         table.upsert_entity(entity=entity, mode="merge")
         # Increment per-run post counter on successful new post
         try:
-            global _RUN_POST_COUNT
             _RUN_POST_COUNT += 1
         except Exception:
             pass
@@ -837,7 +837,7 @@ def _request_with_retries(
     Env controls:
     - HTTP_MAX_RETRIES (default 3)
     """
-    max_retries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
+    max_retries = _env_int("HTTP_MAX_RETRIES", 3)
     base = 1.0
     cap = 8.0
     transient = {429, 500, 502, 503, 504}
