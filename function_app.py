@@ -20,35 +20,80 @@ _token_cache = {"access_token": None, "expires_at": 0}
 @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer")
 def poll_strava_activities(myTimer: func.TimerRequest) -> None:
     """Poll Strava club activities every 5 minutes and post to Discord."""
-    logging.info("Starting Strava club activities poll")
+    start_time = datetime.now(timezone.utc)
+    logging.info("Starting Strava club activities poll", extra={
+        "operation": "poll_strava_activities",
+        "start_time": start_time.isoformat()
+    })
+
+    activities_processed = 0
+    activities_posted = 0
+    activities_updated = 0
 
     try:
         # Get Strava access token
         access_token = get_strava_token()
         if not access_token:
-            logging.error("Failed to get Strava access token")
+            logging.error("Failed to get Strava access token", extra={
+                "operation": "poll_strava_activities",
+                "error_type": "auth_failure"
+            })
             return
 
         # Fetch club activities (first page only)
         activities = fetch_club_activities(access_token)
         if not activities:
-            logging.info("No activities found")
+            logging.info("No activities found", extra={
+                "operation": "poll_strava_activities",
+                "activities_count": 0
+            })
             return
+
+        logging.info(f"Fetched {len(activities)} activities from Strava", extra={
+            "operation": "fetch_club_activities",
+            "activities_count": len(activities)
+        })
 
         # Get table client
         table_client = get_table_client()
         if not table_client:
-            logging.error("Failed to get table client")
+            logging.error("Failed to get table client", extra={
+                "operation": "poll_strava_activities",
+                "error_type": "table_client_failure"
+            })
             return
 
         # Process each activity
         for activity in activities:
-            process_activity(activity, table_client)
+            result = process_activity(activity, table_client)
+            activities_processed += 1
+            if result == "posted":
+                activities_posted += 1
+            elif result == "updated":
+                activities_updated += 1
 
-        logging.info(f"Processed {len(activities)} activities")
+        end_time = datetime.now(timezone.utc)
+        duration = (end_time - start_time).total_seconds()
+
+        logging.info("Completed Strava club activities poll", extra={
+            "operation": "poll_strava_activities",
+            "duration_seconds": duration,
+            "activities_processed": activities_processed,
+            "activities_posted": activities_posted,
+            "activities_updated": activities_updated,
+            "end_time": end_time.isoformat()
+        })
 
     except Exception as e:
-        logging.error(f"Error in poll_strava_activities: {e}")
+        end_time = datetime.now(timezone.utc)
+        duration = (end_time - start_time).total_seconds()
+        logging.error(f"Error in poll_strava_activities: {e}", extra={
+            "operation": "poll_strava_activities",
+            "error_type": "unexpected_error",
+            "duration_seconds": duration,
+            "activities_processed": activities_processed,
+            "exception": str(e)
+        }, exc_info=True)
 
 
 @retry(
@@ -64,6 +109,10 @@ def get_strava_token() -> Optional[str]:
     now = int(datetime.now(timezone.utc).timestamp())
     if (_token_cache["access_token"] and
             _token_cache["expires_at"] > now + 300):
+        logging.debug("Using cached Strava access token", extra={
+            "operation": "get_strava_token",
+            "token_source": "cache"
+        })
         return _token_cache["access_token"]
 
     # Refresh token
@@ -72,26 +121,52 @@ def get_strava_token() -> Optional[str]:
     refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
 
     if not all([client_id, client_secret, refresh_token]):
-        logging.error("Missing Strava OAuth credentials")
+        logging.error("Missing Strava OAuth credentials", extra={
+            "operation": "get_strava_token",
+            "error_type": "missing_credentials",
+            "has_client_id": bool(client_id),
+            "has_client_secret": bool(client_secret),
+            "has_refresh_token": bool(refresh_token)
+        })
         return None
 
-    response = requests.post(
-        "https://www.strava.com/api/v3/oauth/token",
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token"
-        },
-        timeout=30
-    )
-    response.raise_for_status()
+    try:
+        logging.info("Refreshing Strava access token", extra={
+            "operation": "get_strava_token",
+            "token_source": "refresh"
+        })
 
-    data = response.json()
-    _token_cache["access_token"] = data["access_token"]
-    _token_cache["expires_at"] = data["expires_at"]
+        response = requests.post(
+            "https://www.strava.com/api/v3/oauth/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token"
+            },
+            timeout=30
+        )
+        response.raise_for_status()
 
-    return data["access_token"]
+        data = response.json()
+        _token_cache["access_token"] = data["access_token"]
+        _token_cache["expires_at"] = data["expires_at"]
+
+        logging.info("Successfully refreshed Strava access token", extra={
+            "operation": "get_strava_token",
+            "expires_at": data["expires_at"]
+        })
+
+        return data["access_token"]
+
+    except requests.RequestException as e:
+        logging.error(f"Failed to refresh Strava token: {e}", extra={
+            "operation": "get_strava_token",
+            "error_type": "request_failed",
+            "status_code": getattr(e.response, 'status_code', None),
+            "exception": str(e)
+        }, exc_info=True)
+        raise
 
 
 @retry(
@@ -103,19 +178,46 @@ def fetch_club_activities(access_token: str) -> list:
     """Fetch first page of club activities from Strava."""
     club_id = os.getenv("STRAVA_CLUB_ID")
     if not club_id:
-        logging.error("STRAVA_CLUB_ID not set")
+        logging.error("STRAVA_CLUB_ID not set", extra={
+            "operation": "fetch_club_activities",
+            "error_type": "missing_config"
+        })
         return []
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(
-        f"https://www.strava.com/api/v3/clubs/{club_id}/activities",
-        headers=headers,
-        params={"page": 1, "per_page": 30},
-        timeout=30
-    )
-    response.raise_for_status()
+    try:
+        logging.debug("Fetching club activities from Strava", extra={
+            "operation": "fetch_club_activities",
+            "club_id": club_id
+        })
 
-    return response.json()
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get(
+            f"https://www.strava.com/api/v3/clubs/{club_id}/activities",
+            headers=headers,
+            params={"page": 1, "per_page": 30},
+            timeout=30
+        )
+        response.raise_for_status()
+
+        activities = response.json()
+        logging.info(f"Successfully fetched {len(activities)} activities", extra={
+            "operation": "fetch_club_activities",
+            "club_id": club_id,
+            "activities_count": len(activities),
+            "status_code": response.status_code
+        })
+
+        return activities
+
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch club activities: {e}", extra={
+            "operation": "fetch_club_activities",
+            "club_id": club_id,
+            "error_type": "request_failed",
+            "status_code": getattr(e.response, 'status_code', None),
+            "exception": str(e)
+        }, exc_info=True)
+        raise
 
 
 def get_table_client() -> Optional[TableClient]:
@@ -155,12 +257,22 @@ def create_activity_id(activity: Dict[str, Any]) -> str:
     return hashlib.md5(data.encode()).hexdigest()
 
 
-def process_activity(activity: Dict[str, Any], table_client: TableClient) -> None:
+def process_activity(activity: Dict[str, Any], table_client: TableClient) -> str:
     """Process a single activity - check if new/changed and post/update Discord."""
     try:
         activity_id = create_activity_id(activity)
         athlete = activity.get("athlete", {})
         athlete_id = athlete.get("id", "unknown")
+        athlete_name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+
+        logging.debug("Processing activity", extra={
+            "operation": "process_activity",
+            "activity_id": activity_id,
+            "athlete_id": athlete_id,
+            "athlete_name": athlete_name,
+            "activity_name": activity.get("name", ""),
+            "sport_type": activity.get("sport_type")
+        })
 
         # Check if activity exists in table
         try:
@@ -198,7 +310,24 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> Non
             if message_id:
                 entity["discord_message_id"] = message_id
                 table_client.upsert_entity(entity)
-                logging.info(f"Posted new activity: {entity['activity_name']}")
+                logging.info(f"Posted new activity: {entity['activity_name']}", extra={
+                    "operation": "process_activity",
+                    "action": "posted",
+                    "activity_id": activity_id,
+                    "athlete_name": athlete_name,
+                    "activity_name": entity["activity_name"],
+                    "sport_type": entity["sport_type"],
+                    "discord_message_id": message_id
+                })
+                return "posted"
+            else:
+                logging.warning("Failed to post to Discord", extra={
+                    "operation": "process_activity",
+                    "action": "post_failed",
+                    "activity_id": activity_id,
+                    "athlete_name": athlete_name
+                })
+                return "post_failed"
 
         elif should_update:
             # Update existing Discord message
@@ -206,13 +335,45 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> Non
             if message_id and update_discord_message(entity, message_id):
                 entity["discord_message_id"] = message_id
                 table_client.upsert_entity(entity)
-                logging.info(f"Updated activity: {entity['activity_name']}")
+                logging.info(f"Updated activity: {entity['activity_name']}", extra={
+                    "operation": "process_activity",
+                    "action": "updated",
+                    "activity_id": activity_id,
+                    "athlete_name": athlete_name,
+                    "activity_name": entity["activity_name"],
+                    "old_name": existing_entity.get("activity_name"),
+                    "discord_message_id": message_id
+                })
+                return "updated"
+            else:
+                logging.warning("Failed to update Discord message", extra={
+                    "operation": "process_activity",
+                    "action": "update_failed",
+                    "activity_id": activity_id,
+                    "athlete_name": athlete_name,
+                    "discord_message_id": message_id
+                })
+                return "update_failed"
 
         else:
-            logging.debug(f"No changes for activity: {entity['activity_name']}")
+            logging.debug(f"No changes for activity: {entity['activity_name']}", extra={
+                "operation": "process_activity",
+                "action": "skipped",
+                "activity_id": activity_id,
+                "athlete_name": athlete_name,
+                "activity_name": entity["activity_name"]
+            })
+            return "skipped"
 
     except Exception as e:
-        logging.error(f"Error processing activity: {e}")
+        logging.error(f"Error processing activity: {e}", extra={
+            "operation": "process_activity",
+            "error_type": "processing_failed",
+            "activity_id": activity_id if 'activity_id' in locals() else "unknown",
+            "athlete_name": athlete_name if 'athlete_name' in locals() else "unknown",
+            "exception": str(e)
+        }, exc_info=True)
+        return "error"
 
 
 def format_discord_message(entity: Dict[str, Any]) -> str:
@@ -339,20 +500,54 @@ def post_to_discord(entity: Dict[str, Any]) -> Optional[str]:
     """Post new message to Discord and return message ID."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
-        logging.error("DISCORD_WEBHOOK_URL not set")
+        logging.error("DISCORD_WEBHOOK_URL not set", extra={
+            "operation": "post_to_discord",
+            "error_type": "missing_config"
+        })
         return None
 
-    message_content = format_discord_message(entity)
+    try:
+        message_content = format_discord_message(entity)
+        athlete_name = f"{entity.get('athlete_firstname', '')} {entity.get('athlete_lastname', '')}".strip()
 
-    response = requests.post(
-        webhook_url,
-        json={"content": message_content},
-        params={"wait": "true"},
-        timeout=30
-    )
-    response.raise_for_status()
+        logging.debug("Posting to Discord", extra={
+            "operation": "post_to_discord",
+            "athlete_name": athlete_name,
+            "activity_name": entity.get("activity_name"),
+            "sport_type": entity.get("sport_type"),
+            "message_length": len(message_content)
+        })
 
-    return response.json().get("id")
+        response = requests.post(
+            webhook_url,
+            json={"content": message_content},
+            params={"wait": "true"},
+            timeout=30
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        message_id = result.get("id")
+
+        logging.info("Successfully posted to Discord", extra={
+            "operation": "post_to_discord",
+            "athlete_name": athlete_name,
+            "activity_name": entity.get("activity_name"),
+            "discord_message_id": message_id,
+            "status_code": response.status_code
+        })
+
+        return message_id
+
+    except requests.RequestException as e:
+        logging.error(f"Failed to post to Discord: {e}", extra={
+            "operation": "post_to_discord",
+            "error_type": "request_failed",
+            "athlete_name": athlete_name if 'athlete_name' in locals() else "unknown",
+            "status_code": getattr(e.response, 'status_code', None),
+            "exception": str(e)
+        }, exc_info=True)
+        raise
 
 
 @retry(
@@ -364,20 +559,52 @@ def update_discord_message(entity: Dict[str, Any], message_id: str) -> bool:
     """Update existing Discord message."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
-        logging.error("DISCORD_WEBHOOK_URL not set")
+        logging.error("DISCORD_WEBHOOK_URL not set", extra={
+            "operation": "update_discord_message",
+            "error_type": "missing_config"
+        })
         return False
 
-    # Remove query params and add message ID
-    base_url = webhook_url.split("?")[0]
-    edit_url = f"{base_url}/messages/{message_id}"
+    try:
+        # Remove query params and add message ID
+        base_url = webhook_url.split("?")[0]
+        edit_url = f"{base_url}/messages/{message_id}"
 
-    message_content = format_discord_message(entity)
+        message_content = format_discord_message(entity)
+        athlete_name = f"{entity.get('athlete_firstname', '')} {entity.get('athlete_lastname', '')}".strip()
 
-    response = requests.patch(
-        edit_url,
-        json={"content": message_content},
-        timeout=30
-    )
-    response.raise_for_status()
+        logging.debug("Updating Discord message", extra={
+            "operation": "update_discord_message",
+            "athlete_name": athlete_name,
+            "activity_name": entity.get("activity_name"),
+            "discord_message_id": message_id,
+            "message_length": len(message_content)
+        })
 
-    return True
+        response = requests.patch(
+            edit_url,
+            json={"content": message_content},
+            timeout=30
+        )
+        response.raise_for_status()
+
+        logging.info("Successfully updated Discord message", extra={
+            "operation": "update_discord_message",
+            "athlete_name": athlete_name,
+            "activity_name": entity.get("activity_name"),
+            "discord_message_id": message_id,
+            "status_code": response.status_code
+        })
+
+        return True
+
+    except requests.RequestException as e:
+        logging.error(f"Failed to update Discord message: {e}", extra={
+            "operation": "update_discord_message",
+            "error_type": "request_failed",
+            "athlete_name": athlete_name if 'athlete_name' in locals() else "unknown",
+            "discord_message_id": message_id,
+            "status_code": getattr(e.response, 'status_code', None),
+            "exception": str(e)
+        }, exc_info=True)
+        raise
