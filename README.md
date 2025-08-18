@@ -211,18 +211,40 @@ See `requirements.txt` for full dependency list:
 
 ## Architecture
 
-```
-┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   Azure Timer   │───►│ Function App │───►│  Strava API     │
-│   (5 minutes)   │    │              │    │  (Club Feed)    │
-└─────────────────┘    └──────┬───────┘    └─────────────────┘
-                              │
-                              ▼
-                       ┌─────────────────┐    ┌─────────────────┐
-                       │ Table Storage   │    │  Discord API    │
-                       │ (Activities)    │    │  (Webhook)      │
-                       └─────────────────┘    └─────────────────┘
-                              │                        ▲
-                              └────────────────────────┘
-                                  (Activity Updates)
+```mermaid
+graph TD
+    A[Azure Timer<br/>5 minutes] --> B[Function App<br/>poll_strava_activities]
+    B --> C[Strava API<br/>OAuth Refresh]
+    C --> D[Strava API<br/>Club Activities]
+    D --> B
+    B --> E{New/Updated<br/>Activity?}
+    E -->|Yes| F[Table Storage<br/>StravaActivities]
+    E -->|Yes| G[Discord API<br/>Webhook Post]
+    E -->|No| H[Skip Processing]
+    F --> I[Store Activity Data<br/>+ Discord Message ID]
+    G --> J[Enhanced Message<br/>🔥👤 🏅📊⚡⏱️]
+    
+    subgraph "Rate Limiting & Reliability"
+        K[Discord Retry Logic<br/>Exponential Backoff]
+        L[Strava API Retries<br/>Tenacity]
+        M[Application Insights<br/>Structured Logging]
+    end
+    
+    G -.-> K
+    C -.-> L
+    B -.-> M
+    
+    subgraph "Authentication"
+        N[User-Assigned<br/>Managed Identity]
+        O[OAuth Refresh Token<br/>Caching]
+    end
+    
+    F -.-> N
+    C -.-> O
+    
+    style A fill:#e1f5fe
+    style B fill:#f3e5f5
+    style F fill:#e8f5e8
+    style G fill:#fff3e0
+    style J fill:#fce4ec
 ```
