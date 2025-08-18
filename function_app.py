@@ -532,7 +532,8 @@ def get_sport_emoji(sport_type: str) -> str:
         "Workout": "💪",
         "WeightTraining": "🏋️",
         "Yoga": "🧘",
-        "Rowing": "🚣"
+        "Rowing": "🚣",
+        "Pickleball": "🏓"
     }
     return emoji_map.get(sport_type, "🏅")
 
