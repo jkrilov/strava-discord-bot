@@ -472,7 +472,7 @@ def format_discord_message(entity: Dict[str, Any]) -> str:
     moving_time = entity.get("moving_time")
 
     # Start building message
-    lines = [f"🏃 {athlete_name}", f"📝 {activity_name}"]
+    lines = [f"🔥 {athlete_name}", f"🏅 {activity_name}"]
 
     # Add sport type emoji
     sport_emoji = get_sport_emoji(sport_type)
