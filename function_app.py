@@ -426,8 +426,14 @@ def _get_activities_table_client() -> Optional[TableClient]:
     """
     try:
         table_service_uri = _env_str("AzureWebJobsStorage__tableServiceUri")
-        if not table_service_uri:
-            logging.error("AzureWebJobsStorage__tableServiceUri not set; cannot access Table Storage")
+        conn_str = _env_str("AzureWebJobsStorage")
+        if not table_service_uri and not conn_str:
+            logging.error(
+                (
+                    "Table config missing: set AzureWebJobsStorage__tableServiceUri (managed identity) or "
+                    "AzureWebJobsStorage (connection string)"
+                )
+            )
             return None
 
         client_id = (
@@ -435,16 +441,26 @@ def _get_activities_table_client() -> Optional[TableClient]:
             or _env_str("USER_ASSIGNED_MANAGED_IDENTITY_CLIENT_ID")
             or _env_str("AZURE_CLIENT_ID")
         )
-        credential = ManagedIdentityCredential(client_id=client_id) if client_id else ManagedIdentityCredential()
-
-        service = TableServiceClient(endpoint=table_service_uri, credential=credential)
         table_name = _env_str("STRAVA_ACTIVITIES_TABLE", "StravaActivities")
+        service: Optional[TableServiceClient] = None
+        if table_service_uri:
+            credential = ManagedIdentityCredential(client_id=client_id) if client_id else ManagedIdentityCredential()
+            service = TableServiceClient(endpoint=table_service_uri, credential=credential)
+        elif conn_str:
+            # Local fallback (supports Azurite with UseDevelopmentStorage=true)
+            service = TableServiceClient.from_connection_string(conn_str)
+
+        if service is None:
+            logging.error("Failed to initialize TableServiceClient")
+            return None
+
         # Ensure table exists
         try:
             service.create_table_if_not_exists(table_name=table_name)
         except AzureError:
             # table may already exist or lack permission to create
             pass
+
         return service.get_table_client(table_name=table_name)
     except AzureError:
         logging.exception("Failed to create TableClient for activities (Azure error)")
