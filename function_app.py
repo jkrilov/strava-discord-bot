@@ -150,7 +150,8 @@ def create_activity_id(activity: Dict[str, Any]) -> str:
     athlete_name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
     
     # Create hash from name + key metrics
-    data = f"{athlete_name}:{activity.get('distance', 0)}:{activity.get('moving_time', 0)}:{activity.get('elapsed_time', 0)}"
+    data = (f"{athlete_name}:{activity.get('distance', 0)}:"
+            f"{activity.get('moving_time', 0)}:{activity.get('elapsed_time', 0)}")
     return hashlib.md5(data.encode()).hexdigest()
 
 
@@ -189,7 +190,7 @@ def process_activity(activity: Dict[str, Any], table_client: TableClient) -> Non
         # Determine if we need to post or update
         should_post = existing_entity is None
         should_update = (existing_entity is not None and
-                        existing_entity.get("activity_name") != entity["activity_name"])
+                         existing_entity.get("activity_name") != entity["activity_name"])
         
         if should_post:
             # Post new message to Discord
@@ -256,7 +257,7 @@ def get_sport_emoji(sport_type: str) -> str:
     """Get emoji for sport type."""
     emoji_map = {
         "Run": "🏃",
-        "TrailRun": "🥾", 
+        "TrailRun": "🥾",
         "Ride": "🚴",
         "Swim": "🏊",
         "Walk": "🚶",
