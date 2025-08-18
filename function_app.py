@@ -483,10 +483,18 @@ def format_discord_message(entity: Dict[str, Any], include_separator: bool = Fal
     # Start building message
     lines = [f"🔥 {athlete_name}", f"🏅 {activity_name}"]
 
-    # Add sport type emoji
+    # Add sport type emoji and workout type if available
     sport_emoji = get_sport_emoji(sport_type)
     if sport_emoji:
-        lines.append(f"{sport_emoji} {sport_type}")
+        workout_type = entity.get("workout_type")
+        if workout_type:
+            workout_label = get_workout_type_label(workout_type)
+            if workout_label:
+                lines.append(f"{sport_emoji} {sport_type} - {workout_label}")
+            else:
+                lines.append(f"{sport_emoji} {sport_type}")
+        else:
+            lines.append(f"{sport_emoji} {sport_type}")
 
     # Add distance (skip for certain activity types)
     if should_include_distance(sport_type) and distance:
@@ -527,6 +535,28 @@ def get_sport_emoji(sport_type: str) -> str:
         "Rowing": "🚣"
     }
     return emoji_map.get(sport_type, "🏅")
+
+
+def get_workout_type_label(workout_type: int) -> str:
+    """Get human-readable label for Strava workout type."""
+    # Strava workout type mappings based on their API documentation
+    # Note: workout_type 0 (Default) returns empty string to avoid appending
+    workout_types = {
+        # Running workout types
+        1: "Race",
+        2: "Long Run",
+        3: "Workout",
+
+        # Cycling workout types
+        10: "Race",
+        11: "Workout",
+        12: "Time Trial",
+
+        # Swimming workout types
+        # (Swimming uses different numbering but less common in club activities)
+    }
+
+    return workout_types.get(workout_type, "")
 
 
 def should_include_distance(sport_type: str) -> bool:
