@@ -6,6 +6,7 @@ Azure Functions (Python 3.12) app that polls a Strava club feed every 5 minutes 
 
 - ⏰ **Timer-triggered** polling every 5 minutes (cron: `0 */5 * * * *`)
 - 🔄 **OAuth token refresh** with automatic caching and retry logic
+- 🔑 **Token scope verification** — probes `/athlete/activities` after each refresh and raises if `activity:read_all` is missing (see Troubleshooting)
 - 📊 **Enhanced Discord messages** with emojis, pace calculations, and workout type labels
 - 🛡️ **Rate limiting protection** with custom Discord retry logic and exponential backoff
 - 📈 **Application Insights logging** with structured telemetry and performance metrics
@@ -160,6 +161,21 @@ func start
 - Validate `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, and `STRAVA_REFRESH_TOKEN`
 - Check `STRAVA_CLUB_ID` is correct and accessible with your token
 - Monitor Application Insights for token refresh failures
+
+**Missing `activity:read_all` scope (silent outage)**:
+
+If the refresh token loses the `activity:read_all` scope, Strava will return
+`HTTP 200 []` from `GET /clubs/{id}/activities` for **private** clubs — the poll
+looks healthy while posting nothing. `verify_strava_scope()` now probes
+`/athlete/activities` after every token refresh and raises if the scope is
+missing. Symptoms and fix:
+
+- **Symptom**: App Insights shows `Successfully fetched 0 activities` repeatedly
+  and a `RuntimeError: Strava token missing activity:read_all scope` exception
+  with log message containing `"error_type": "missing_scope"`.
+- **Fix**: Reauthorize with `scope=read,activity:read_all` and update
+  `STRAVA_REFRESH_TOKEN`. Full steps in
+  [`docs/RUNBOOK.md`](../docs/RUNBOOK.md) of the StravaBot infra repo.
 
 **Discord Posting Problems**:
 - Verify `DISCORD_WEBHOOK_URL` is correct and active

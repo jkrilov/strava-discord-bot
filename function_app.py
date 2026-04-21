@@ -214,6 +214,8 @@ def get_strava_token() -> Optional[str]:
             "expires_at": data["expires_at"]
         })
 
+        verify_strava_scope(data["access_token"])
+
         return data["access_token"]
 
     except requests.RequestException as e:
@@ -224,6 +226,68 @@ def get_strava_token() -> Optional[str]:
             "exception": str(e)
         }, exc_info=True)
         raise
+
+
+def verify_strava_scope(access_token: str) -> None:
+    """Probe /athlete/activities to verify the token has activity:read_all.
+
+    Strava silently returns `200 []` from /clubs/{id}/activities when the token
+    lacks activity:read_all for a private club, which makes the poll look
+    healthy while posting nothing. Hitting /athlete/activities surfaces the
+    scope problem as a 401 we can log loudly and raise on.
+    """
+    try:
+        response = requests.get(
+            "https://www.strava.com/api/v3/athlete/activities",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"per_page": 1},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        # Don't fail the poll for a transient network hiccup on the probe.
+        logging.warning(f"Strava scope probe failed (network): {e}", extra={
+            "operation": "verify_strava_scope",
+            "error_type": "probe_network_error",
+            "exception": str(e),
+        })
+        return
+
+    if response.status_code == 401:
+        body: Dict[str, Any] = {}
+        try:
+            body = response.json()
+        except ValueError:
+            pass
+        missing_scope = any(
+            err.get("field") == "activity:read_permission"
+            and err.get("code") == "missing"
+            for err in body.get("errors", [])
+        )
+        if missing_scope:
+            logging.error(
+                "Strava token is missing activity:read_all scope. "
+                "Private club activities will silently return []. "
+                "Reauthorize with scope=read,activity:read_all and update "
+                "STRAVA_REFRESH_TOKEN. See docs/RUNBOOK.md.",
+                extra={
+                    "operation": "verify_strava_scope",
+                    "error_type": "missing_scope",
+                    "required_scope": "activity:read_all",
+                    "strava_response": body,
+                },
+            )
+            raise RuntimeError(
+                "Strava token missing activity:read_all scope"
+            )
+
+    if not response.ok:
+        logging.warning(
+            f"Strava scope probe returned {response.status_code}",
+            extra={
+                "operation": "verify_strava_scope",
+                "status_code": response.status_code,
+            },
+        )
 
 
 @retry(
